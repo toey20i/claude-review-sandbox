@@ -13,3 +13,8 @@ test("applyDiscount takes a percentage off", () => {
 test("applyDiscount rejects out-of-range percentages", () => {
   assert.throws(() => applyDiscount(1000, 101), RangeError);
 });
+
+test("totalQuantity sums quantities", () => {
+  const { totalQuantity } = require("./cart");
+  assert.strictEqual(totalQuantity([{ priceCents: 250, qty: 2 }, { priceCents: 100, qty: 3 }]), 5);
+});

@@ -13,7 +13,7 @@ function applyDiscount(totalCents, percent) {
 
 // Total quantity of every item in the cart.
 function totalQuantity(items) {
-  return items.reduce((n, item) => n + item.priceCents, 0);
+  return items.reduce((n, item) => n + item.qty, 0);
 }
 
 module.exports = { subtotal, applyDiscount, totalQuantity };
