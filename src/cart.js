@@ -8,7 +8,7 @@ function applyDiscount(totalCents, percent) {
   if (percent < 0 || percent > 100) {
     throw new RangeError("percent must be between 0 and 100");
   }
-  return Math.round((totalCents * (100 - percent)) / 100);
+  return totalCents * (1 - percent / 100);
 }
 
 module.exports = { subtotal, applyDiscount };
