@@ -1,0 +1,608 @@
+# Claude Review — the expensive review, run on every new commit.
+#
+# ---------------------------------------------------------------------------
+# THIS WORKFLOW MUST NEVER RECEIVE PHI.
+#
+# Its safety argument rests entirely on the review input being source code plus
+# synthetic, non-production data. It authenticates with a personal Claude
+# subscription (OAuth) under Anthropic's Consumer Terms, which is appropriate
+# for source code -- code is not PHI -- and is NOT appropriate for protected
+# health information. There is no BAA covering this path.
+#
+# If PHI, production data, or production-derived fixtures ever need to enter the
+# review context, STOP. Replace this with a commercial, BAA-covered arrangement
+# first. See docs/claude-pr-review.md.
+# ---------------------------------------------------------------------------
+#
+# DO NOT MARK THIS CHECK REQUIRED. An unrelated label produces a run of this
+# workflow whose job is skipped, and GitHub counts a skipped required check as
+# success. Mark `Claude Review Gate` required instead; it reads this workflow's
+# run metadata rather than its check status, and a skipped run has conclusion
+# `skipped`, not `success`, so it can never be mistaken for approval.
+#
+# Runs automatically when a pull request is opened, reopened, marked ready for
+# review, or receives a new commit, or when its title is edited. Drafts and
+# pull requests with no `CHES-<n>` ticket in the title are skipped -- designers
+# open ticketless pull requests for prototyping, and those need no review
+# spend. Adding a ticket to the title triggers the review. Adding the
+# `claude-review` label re-runs it by hand -- only useful after an
+# infrastructure failure (timeout, usage limit), since a commit gets one verdict.
+#
+# This workflow NEVER approves or requests changes itself: it executes from the
+# pull request's head, so a pull request could rewrite it to approve itself.
+# It only records a verdict. `Claude Review Gate` -- which executes from the
+# default branch -- reads that verdict and submits the GitHub review.
+name: Claude Review
+
+on:
+  pull_request:
+    # `edited` so that adding a ticket to the title starts the review.
+    types: [opened, reopened, ready_for_review, synchronize, edited, labeled]
+
+jobs:
+  review:
+    # The label and edit filters live here, not on the trigger, because `on:`
+    # cannot filter by label name or by which field was edited. Any other label,
+    # or an edit that does not touch the title (body edits would otherwise
+    # cancel a review in flight), produces a skipped job.
+    #
+    # `contains` is case-insensitive. `Claude Review Gate` applies the stricter
+    # `CHES-<digits>` test and never approves a ticketless pull request, so this
+    # coarse filter only decides whether usage is spent.
+    if: >-
+      !github.event.pull_request.draft &&
+      contains(github.event.pull_request.title, 'CHES-') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'claude-review') &&
+      (github.event.action != 'edited' || github.event.changes.title != null)
+    name: Claude Review
+    runs-on: ubuntu-latest
+    # Reviews of this pull request have grown from ~9 minutes to over 30 as the
+    # workflow files have. A timeout is an infrastructure outcome, not a verdict,
+    # so it is retryable and cannot brick a commit -- but it wastes a full run's
+    # subscription usage, so give it headroom.
+    timeout-minutes: 50
+
+    # JOB-level concurrency, deliberately. At workflow level, a run triggered by
+    # an unrelated label would join the group before the `if` is evaluated and
+    # could cancel a real review in flight. Job-level concurrency is only
+    # entered by jobs that actually run.
+    #
+    # Keyed on the pull request, with cancel-in-progress: a new push supersedes
+    # the review of the old head, whose result would be discarded as stale
+    # anyway. A cancelled run is an infrastructure outcome, not a verdict, so
+    # the old commit is simply left unreviewed.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    permissions:
+      contents: read
+      pull-requests: write # post inline comments, remove the trigger label
+      issues: read
+      checks: read
+      actions: read # look up whether this SHA was already reviewed
+      # NO id-token. The job authenticates to GitHub with GITHUB_TOKEN and never
+      # performs an OIDC exchange. [sandbox copy: detail redacted]
+
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_REF: ${{ github.base_ref }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+
+    steps:
+      # THE APPROVAL ANCHOR.
+      #
+      # A step name is evaluated when the run starts and stored in the run's
+      # metadata, per attempt. No workflow can write it, the reviewed code
+      # cannot reach it, and this file is integrity-checked by the gate -- so
+      # this step name is an unforgeable record of WHAT was reviewed.
+      #
+      # It exists because `workflow_run.pull_requests[]`, which this design
+      # previously relied on, lists only OPEN pull requests: closing one empties
+      # it and erases every approval recorded against it. That was mutable state
+      # standing in for an immutable record.
+      #
+      # The verdict binds to pr + head + base REF, like a human approval: a
+      # retarget to another branch invalidates it, `main` advancing does not.
+      # (Binding the base SHA would dismiss every approval on every merge to
+      # `main`, and nothing would re-trigger the reviews.) base.sha is recorded
+      # for the audit trail only.
+      - name: "context pr=${{ github.event.pull_request.number }} head=${{ github.event.pull_request.head.sha }} ref=${{ github.base_ref }} base=${{ github.event.pull_request.base.sha }}"
+        # Block scalar, not a plain one: in a plain YAML scalar a space followed
+        # by `#` begins a comment, so `echo "... PR #$PR_NUMBER ..."` truncates
+        # mid-string and the step dies on an unterminated quote.
+        run: |
+          echo "Reviewing PR $PR_NUMBER head $HEAD_SHA against base $BASE_SHA"
+
+      # Cheap guard against re-reviewing a commit that already passed, so a
+      # double label add does not spend the subscription twice.
+      # A commit gets ONE verdict. If this SHA already has a completed review,
+      # reuse it rather than spending the subscription again -- and, crucially,
+      # re-exit with the SAME conclusion. Re-adding the label must never turn a
+      # failing SHA into a passing one; the way to get a new verdict is a new
+      # commit.
+      - name: Reuse any existing verdict for this SHA
+        id: already
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # --paginate: enough runs against one commit would otherwise push the
+          # relevant verdict off page 1 and empty this query.
+          gh api "repos/${{ github.repository }}/actions/workflows/claude-review.yml/runs?head_sha=$HEAD_SHA&per_page=100" \
+            --paginate | jq -s '{workflow_runs: (map(.workflow_runs) | add // [])}' \
+            > "$RUNNER_TEMP/runs.json"
+
+          # Ask every run for this commit, at EVERY ATTEMPT, whether a completed
+          # review rejected it under THIS pull request and THIS base commit.
+          #
+          # A re-run reuses the run id and overwrites its conclusion, so a run's
+          # current conclusion is not durable; previous attempts are preserved
+          # and are read here. A rejection is sticky if any attempt of any run
+          # rejected this exact context.
+          PRIOR="none"
+          REJECTED=false
+          APPROVED=false
+          while read -r rid attempts; do
+            [ -n "$rid" ] || continue
+            for k in $(seq 1 "${attempts:-1}"); do
+              if ! RESP=$(gh api "repos/${{ github.repository }}/actions/runs/$rid/attempts/$k/jobs" 2>/dev/null); then
+                echo "::warning::Could not read attempt $k of run $rid; treating this commit as rejected."
+                REJECTED=true; break 2
+              fi
+              CTX=$(jq -r '[.jobs[].steps[]? | select(.name | startswith("context ")) | .name] | first // ""' <<<"$RESP")
+              case "$CTX" in "context pr=$PR_NUMBER head=$HEAD_SHA ref=$BASE_REF "*) ;; *) continue ;; esac
+              STEP=$(jq -r '[.jobs[].steps[]? | select(.name == "Verdict: no blocking findings") | .conclusion] | first // "absent"' <<<"$RESP")
+              case "$STEP" in
+                failure) REJECTED=true; break 2 ;;
+                success) APPROVED=true ;;
+              esac
+            done
+          done <<<"$(jq -r '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"' "$RUNNER_TEMP/runs.json")"
+
+          if [ "$REJECTED" = true ]; then PRIOR="failure"
+          elif [ "$APPROVED" = true ]; then PRIOR="success"
+          fi
+          echo "Prior verdict for this pr/head/ref: $PRIOR"
+
+          case "$PRIOR" in
+            success)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Already reviewed clean; not spending the subscription again." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            failure)
+              # A real review that found problems. Sticky: re-labelling must not
+              # launder a failure into a pass. A new commit gets a new review.
+              # skip=true so the always() verdict steps stand down instead of
+              # appending a contradictory "retryable" note to this summary.
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::error::$HEAD_SHA already failed review. Push a fix; a new commit is reviewed automatically."
+              {
+                echo "## Claude Review — already failed at this commit"
+                echo ""
+                echo "\`$HEAD_SHA\` was already reviewed and did not pass. Re-labelling cannot change that verdict."
+                echo "Address the blocking findings and push; the new commit is reviewed automatically."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+            *)
+              # cancelled, timed_out, neutral, action_required, stale, none, and
+              # infra-failure -- a run that concluded `failure` without posting
+              # any finding, i.e. it never actually reviewed.
+              # These are infrastructure outcomes, not review verdicts -- a run
+              # killed by the 30-minute timeout or cancelled by hand must be
+              # retryable, or a transient failure would permanently block the
+              # commit with no way back.
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              [ "$PRIOR" = "none" ] || echo "Previous attempt ended as '$PRIOR' (not a review verdict); retrying."
+              ;;
+          esac
+
+      # `pull_request`, NOT `pull_request_target`: the latter would run with
+      # repository secrets against an untrusted head. Fork PRs therefore get no
+      # secrets and no review, which is the correct trade.
+      - name: Checkout
+        if: steps.already.outputs.skip != 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The pull request must not be able to rewrite the rules it is judged by.
+      # The action already restores CLAUDE.md and .claude/ from the base branch
+      # for this reason; REVIEW.md needs the same treatment.
+      - name: Pin review instructions to the base branch
+        if: steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # Checkout ran with persist-credentials: false so no credential is
+          # left in .git/config for the review shell to read; this fetch carries
+          # its own auth inline and does not persist it.
+          git fetch --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$BASE_REF"
+          # A pull request must not ship its own instruction files into the
+          # review. CLAUDE.local.md is loaded by Claude Code alongside CLAUDE.md
+          # and is not a tracked convention file, so it is removed outright
+          # rather than pinned.
+          find . -name 'CLAUDE.local.md' -not -path './.git/*' -delete 2>/dev/null || true
+
+          if git cat-file -e FETCH_HEAD:REVIEW.md 2>/dev/null; then
+            git checkout FETCH_HEAD -- REVIEW.md
+            echo "REVIEW.md pinned to origin/$BASE_REF"
+          else
+            # Bootstrap: no base version exists yet. Review without instructions
+            # rather than falling back to the PR author's copy.
+            rm -f REVIEW.md
+            echo "::warning::REVIEW.md is not on $BASE_REF; reviewing without repository review instructions."
+          fi
+
+      # No filesystem snapshot: the review agent shares this runner, so any
+      # file it could write is a lever for a prompt injection in the reviewed
+      # code to forge a clean result. The run's own start time comes from
+      # GitHub, and the comment list is read back from the API.
+      # The review reads the pull request diff, so anything the pull request
+      # CONTAINS reaches the model. No deny-list applies to the diff, and telling
+      # the reviewer to "stop if it looks like patient data" is advice, not a
+      # control -- it has already received the content by then. Refusing before
+      # the review is the only point at which refusing still means anything.
+      #
+      # Every status except `removed` is considered: a rename is reported as
+      # `renamed`, and a rename-with-edits still carries the new content, so
+      # `git mv fixtures/sample.txt data/patient_export.csv` would otherwise slip
+      # past entirely.
+      #
+      # Pattern tuned against the whole tree: no existing file matches, while
+      # patient-export.csv, dump.sql, .env.production, server.pem and
+      # secrets.json all do; .env.example, .env.test and *.interface.ts do not.
+      - name: Refuse likely production data or credentials
+        if: steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PAT='(?i)(\.(csv|sql|dump|bak|pfx|p12|jks|keystore|pem|key)$)|(^|/)\.env(\.(local|prod|production|staging))?$|(^|/)(secrets?|credentials?)\.(json|ya?ml|txt|csv|env)$|(patient|phi)[-_.]?(data|export|dump|records?)'
+          RISKY=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate \
+            | jq -s -r --arg p "$PAT" \
+              '[.[][] | select(.status != "removed") | .filename]
+               | map(select(test($p))) | unique | join(" ")')
+          if [ -n "$RISKY" ]; then
+            echo "::error::Refusing to review — these paths look like production data or credentials: $RISKY"
+            {
+              echo "## Claude Review — refused"
+              echo ""
+              echo "This pull request adds or changes paths whose shape suggests production data, a dump, or a credential:"
+              echo ""
+              for f in $RISKY; do echo "- \`$f\`"; done
+              echo ""
+              echo "The review reads the pull request diff, so their contents would reach the model before anything could judge them. Remove them; if they are genuinely synthetic, rename them so they do not match."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "No risky paths added or modified."
+
+      - name: Record review start
+        id: started
+        if: steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "at=$(gh api "repos/${{ github.repository }}/actions/runs/$GITHUB_RUN_ID" --jq '.created_at')" >> "$GITHUB_OUTPUT"
+
+      - name: Review
+        id: review
+        if: steps.already.outputs.skip != 'true'
+        continue-on-error: true # the Verdict step below is the single decision point
+        env:
+          # /code-review dispatches its finder agents as BACKGROUND subagents and
+          # returns before they report. Force them into the foreground so the
+          # run completes within the step.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+        uses: anthropics/claude-code-action@v1
+        with:
+          # The only Anthropic credential this job receives. No secrets:
+          # inherit, no AWS role, no env block sourcing other secrets.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Authenticate to GitHub with the job's own token rather than the
+          # Claude GitHub App: installing that app is an org-owner action, and
+          # its permission set cannot be subset, so it would grant
+          # Contents:write and Workflows:write to a job that only reads code and
+          # posts comments.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+          # Keeps the bot's own prior comments out of the review context so a
+          # re-review reasons about the code rather than about itself. Note this
+          # does NOT stop the skill's own preflight skip -- that is handled by
+          # the instruction in --append-system-prompt below.
+          exclude_comments_by_actor: "github-actions[bot]"
+
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+
+          # Deny beats allow. These bound what the review can read regardless of
+          # what the allowlist permits. [sandbox copy: detail redacted]
+          #
+          # The absolute-path rules cover what the `./`-rooted ones cannot:
+          # Read/Grep/Glob are NOT sandboxed to the working directory the way
+          # Bash is, so without them an injected instruction could read
+          # `/proc/self/environ` (where CLAUDE_CODE_OAUTH_TOKEN is visible to the
+          # spawned CLI), dotfiles under the runner home, or `work/_temp` (which
+          # holds the runner file-command files).
+          #
+          # They are enumerated rather than written as `Read(//**)`. A blanket
+          # absolute deny FAILS OPEN, and badly: Claude Code's Read takes an
+          # ABSOLUTE path, the workspace is `/home/runner/work/...`, and HOME is
+          # `/home/runner` -- so `Read(//**)` plus `Read(~/**)` denies the
+          # checked-out tree itself. Deny beats allow, the reviewer can read
+          # nothing, it posts no findings, and "no findings" is what this gate
+          # treats as clean. The workspace must stay readable.
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Read(//proc/**)",
+                  "Read(//sys/**)",
+                  "Read(//etc/**)",
+                  "Read(//root/**)",
+                  "Read(//run/**)",
+                  "Read(//var/**)",
+                  "Read(//tmp/**)",
+                  "Read(~/.**)",
+                  "Read(//home/*/.**)",
+                  "Read(//home/runner/work/_temp/**)",
+                  "Read(./sandbox-private/**)",
+                  "Read(./sandbox-private.txt)",
+                  "Read(./**/.env)",
+                  "Read(./**/.env.*)",
+                  "Read(./**/*.pem)",
+                  "Read(./**/*.key)",
+                  "Read(./**/*.p12)",
+                  "Read(./**/*.keystore)",
+                  "Bash(curl:*)",
+                  "Bash(wget:*)",
+                  "Bash(npm:*)",
+                  "Bash(npx:*)",
+                  "Bash(node:*)",
+                  "Bash(rm:*)",
+                  "Bash(git push:*)",
+                  "Bash(gh pr merge:*)",
+                  "Bash(gh secret:*)",
+                  "Bash(gh api:*)",
+                  "Bash(cat:*)",
+                  "Bash(head:*)",
+                  "Bash(tail:*)",
+                  "Bash(find:*)",
+                  "Bash(jq:*)",
+                  "Bash(sed:*)",
+                  "Bash(awk:*)",
+                  "Bash(git show:*)",
+                  "Bash(git cat-file:*)",
+                  "Bash(git diff:*)",
+                  "Bash(git log:*)",
+                  "Bash(git grep:*)"
+                ]
+              }
+            }
+
+          # Only verbs that cannot dump arbitrary file contents. `git diff`,
+          # `git log -p` and `git grep` all print file contents and ignore the
+          # Read deny paths, so they are denied.
+          #
+          # `gh pr view` / `gh pr diff` are PINNED TO THIS PULL REQUEST in the
+          # allowlist rather than left open. `Bash(<prefix>:*)` is a prefix
+          # match, so a bare `Bash(gh pr diff:*)` would permit
+          # `gh pr diff <any-other-pr-or-branch>` and print any file that PR
+          # touched, straight past the Read deny paths. Pinning the number and
+          # repo is what makes "scoped to the pull request" true in enforcement
+          # and not merely in intent.
+          #
+          # File reading goes through Read, which honours the deny paths above.
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,Task,Bash(git status:*),Bash(gh pr view ${{ github.event.pull_request.number }} --repo ${{ github.repository }}:*),Bash(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }}:*),Bash(ls:*),Bash(wc:*),mcp__github_inline_comment__create_inline_comment"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["decision","body"],"properties":{"decision":{"type":"string","enum":["approve","request_changes"]},"body":{"type":"string","minLength":1}}}'
+            --append-system-prompt "IMPORTANT -- DO NOT SKIP THIS REVIEW. The /code-review preflight normally stops when a review bot has already commented on a pull request. That precondition does not apply here: this workflow deliberately re-reviews every new commit, and it enforces one verdict per commit itself, so earlier comments belong to earlier commits. Existing review comments are never a reason to stop. Always perform the full review of the current diff. Your review has two channels. (1) OPTIONAL inline comments, posted with the inline-comment tool with confirmed set to true, for findings that belong on a specific changed line. EVERY inline comment body MUST begin with exactly one severity tag: [blocking] or [non-blocking]. [blocking] means the pull request must not merge until it is fixed: a correctness bug or regression, data loss, an unsafe migration, a race, a security, authorization or PHI/privacy problem, a broken API contract, a test that does not test what it claims, or a violation of a MUST rule in CLAUDE.md or REVIEW.md. Everything else -- style, naming, readability, optional refactors, minor suggestions -- is [non-blocking]. A comment without a tag is counted as [blocking]. (2) REQUIRED: finish by returning the structured output with `decision` and `body`. `body` is the top-level GitHub review, written the way a senior engineer on this team writes one: open with a heading `## Approving -- <one-line reason>` or `## Requesting changes -- <the one concrete ask>`; then what you verified and how, citing file:line; then the blocking asks, each specific enough to act on; then non-blocking notes or follow-up tickets, clearly marked as not change requests. Do not pad it and do not restate inline comments verbatim. `decision` is `request_changes` if there is ANY blocking issue -- in the body or in an inline comment -- and `approve` only when there is none. The workflow requests changes if `decision` is not `approve` OR any inline comment is [blocking], and approves otherwise, with your `body` as the review text. Read REVIEW.md at the repository root before reviewing and treat its contents as binding review instructions alongside CLAUDE.md. You are reviewing source code only. If you encounter anything that looks like real patient data, production credentials, or a production data dump, do not quote it -- report its file:line and stop reading that file."
+
+      # THE DECISION, IN TWO NAMED STEPS.
+      #
+      # Split deliberately. A run's per-step conclusions are recorded by GitHub
+      # and cannot be edited or deleted, so which of these two failed is an
+      # immutable record of WHY a commit was rejected. The "Reuse any existing
+      # verdict" step reads exactly that. Deciding in one step would leave the
+      # reason discoverable only from mutable data -- comment counts, which
+      # anyone with write access can delete.
+      #
+      # This one covers everything that means "no usable review happened".
+      # Failing here is retryable: the commit gets no verdict.
+      - name: "Verdict: review completed"
+        id: completed
+        if: always() && steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.review.outcome }}" != "success" ]; then
+            echo "::error::Claude review did not complete (${{ steps.review.outcome }}). Not approving $HEAD_SHA."
+            {
+              echo "## Claude Review — could not review"
+              echo ""
+              echo "The review did not complete (\`${{ steps.review.outcome }}\`), so this commit has no verdict."
+              echo "Common causes: the Claude subscription hit its usage limit, the run timed out, or the OAuth token is missing or expired."
+              echo ""
+              echo "This is retryable — re-add the \`claude-review\` label."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Positive evidence that a review actually happened. "No findings" and
+          # "never looked" are otherwise indistinguishable. The action writes this
+          # under RUNNER_TEMP, outside the workspace; `Write` is not allowlisted
+          # and Claude Code blocks redirection outside the working directory, so
+          # the reviewed code cannot author it.
+          EXEC="$RUNNER_TEMP/claude-execution-output.json"
+          if [ ! -f "$EXEC" ]; then
+            echo "::error::No execution record from the review. Not approving $HEAD_SHA."
+            echo "## Claude Review — no execution record" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # NB: `.is_error // true` would be wrong -- jq's `//` fires on `false`
+          # as well as `null`, turning a clean run into an error.
+          IS_ERR=$(jq -s -r '[.. | objects | select(.type? == "result")] | last // {} | if .is_error == false then "false" else "true" end' "$EXEC")
+          TURNS=$(jq -s -r '[.. | objects | select(.type? == "result")] | last | .num_turns // 0' "$EXEC")
+          echo "Execution record: is_error=$IS_ERR num_turns=$TURNS"
+
+          if [ "$IS_ERR" != "false" ]; then
+            echo "::error::Review reported an error. Not approving $HEAD_SHA."
+            echo "## Claude Review — errored" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # Real reviews of this repo run 15-43 turns; a suppressed or
+          # short-circuited one runs 3-4.
+          if [ "$TURNS" -lt 5 ]; then
+            echo "::error::Review did only $TURNS turn(s) — too little to be a real review."
+            {
+              echo "## Claude Review — implausibly short"
+              echo ""
+              echo "The review completed in $TURNS turn(s), too few to constitute an actual review of this diff."
+              echo "Silence is treated as failure, not as a clean result."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # The structured verdict + review body must be present and valid.
+          # Read from the execution record (same trust argument as the
+          # findings count below), not from anything in the workspace.
+          jq -s '[.. | objects | select(.type? == "result")] | last | .structured_output // empty' "$EXEC" \
+            > "$RUNNER_TEMP/verdict.json" || true
+          if ! jq -e '(.decision == "approve" or .decision == "request_changes") and ((.body // "") | length > 0)' \
+               "$RUNNER_TEMP/verdict.json" >/dev/null 2>&1; then
+            echo "::error::Review returned no valid structured verdict. Not approving $HEAD_SHA."
+            {
+              echo "## Claude Review — no verdict"
+              echo ""
+              echo "The review finished without a valid \`decision\` / \`body\`. This is retryable — re-add the \`claude-review\` label."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/review-body"
+          # GitHub caps a review body at 65536 characters.
+          jq -r '.body' "$RUNNER_TEMP/verdict.json" | head -c 60000 > "$RUNNER_TEMP/review-body/body.md"
+
+          # The commit must not have moved while the review ran, or the result
+          # describes something other than what is now proposed.
+          NOW=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')
+          if [ "$NOW" != "$HEAD_SHA" ]; then
+            echo "::error::Head moved during review ($HEAD_SHA -> $NOW). Discarding this result."
+            {
+              echo "## Claude Review — stale"
+              echo ""
+              echo "The pull request advanced to \`$NOW\` while \`$HEAD_SHA\` was being reviewed, so this result is discarded."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      # A real review happened. This step decides whether it PASSED: no
+      # [blocking] finding. Non-blocking findings stay on the PR as comments
+      # but do not withhold approval. Failing here is the sticky verdict: the
+      # commit was reviewed and rejected, and re-running must not change that.
+      #
+      # `Claude Review Gate` keys on this exact step name.
+      - name: "Verdict: no blocking findings"
+        id: findings
+        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Findings are counted from the run's own execution record, not from
+          # a live comment query. A collaborator with ordinary write access can
+          # DELETE the bot's comments in the window between the review posting
+          # them and this step counting them, turning a real rejection into
+          # "no findings". The execution record is written under RUNNER_TEMP,
+          # outside the workspace, by the action rather than by Claude -- `Write`
+          # is not allowlisted and Claude Code blocks redirection out of the
+          # working directory -- so it cannot be edited by the reviewed code or
+          # by a collaborator.
+          EXEC="$RUNNER_TEMP/claude-execution-output.json"
+          # Fail closed on severity: anything whose body does not START with
+          # [non-blocking] -- an untagged comment, an unexpected input shape --
+          # counts as blocking.
+          jq -s '[.. | objects
+                  | select(.type? == "tool_use")
+                  | select((.name? // "") | test("inline_comment"))
+                  | (.input.body? // "" | tostring)]' "$EXEC" > "$RUNNER_TEMP/findings.json"
+          POSTED=$(jq 'length' "$RUNNER_TEMP/findings.json")
+          BLOCKING=$(jq '[.[] | select(test("^\\s*\\[non-blocking\\]"; "i") | not)] | length' "$RUNNER_TEMP/findings.json")
+
+          # The record is the decision, on its own. An API count was previously
+          # folded in with max(), which was wrong twice over: a rate limit or 5xx
+          # on that call fails this step under `set -e`, and a step failure here
+          # is read back as a sticky REJECTION -- permanently bricking a clean
+          # commit; and it counts any bot inline comment in the window, so an
+          # unrelated bot could inflate it into a rejection. The record already
+          # cannot be deleted, which was the only thing max() was buying.
+          #
+          # The API count is logged for operators, never used to decide, and
+          # never allowed to fail the step.
+          SEEN=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/comments" --paginate 2>/dev/null \
+            | jq -s --arg since "${{ steps.started.outputs.at }}" \
+              '[.[][] | select(.created_at > $since)
+                      | select(.user.login | test("^(github-actions|claude)\\[bot\\]$"))] | length' 2>/dev/null || echo "unknown")
+          DECISION=$(jq -r '.decision' "$RUNNER_TEMP/verdict.json")
+          echo "Decision: $DECISION. Inline comments: $POSTED, of which blocking: $BLOCKING (visible on the PR right now: $SEEN)"
+
+          if [ "$DECISION" != "approve" ] || [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::Claude requested changes ($DECISION, $BLOCKING blocking inline). Requesting changes on $HEAD_SHA."
+            {
+              echo "## Claude Review — changes requested ($DECISION, $BLOCKING blocking inline)"
+              echo ""
+              cat "$RUNNER_TEMP/review-body/body.md"
+              echo ""
+              echo "Fix the blocking issues and push; the new commit is reviewed automatically."
+              echo ""
+              echo "_Re-running this same commit will not change the verdict._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## Claude Review — no blocking issues"
+            echo ""
+            echo "\`$HEAD_SHA\` passes; \`Claude Review Gate\` will approve this commit."
+            echo ""
+            cat "$RUNNER_TEMP/review-body/body.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The review TEXT for the gate, which submits it as the GitHub review.
+      # Only the text travels this way: the DECISION is read by the gate from
+      # this run's step conclusions, which no workflow can edit. The body is
+      # Claude's prose about source code -- the same content already posted as
+      # comments -- and expires quickly.
+      - name: Hand the review body to the gate
+        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-body
+          path: ${{ runner.temp }}/review-body/body.md
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # always(), so a failed, cancelled or timed-out run still clears the
+      # label. Removing it fires `unlabeled`, which is not a trigger, so this
+      # cannot loop. The label is a trigger, never a record of approval.
+      - name: Remove the trigger label
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X DELETE \
+            "repos/${{ github.repository }}/issues/$PR_NUMBER/labels/claude-review" \
+            --silent || true

@@ -1,0 +1,339 @@
+# Claude Review Gate — the cheap, deterministic, REQUIRED check.
+#
+# Never invokes Claude. Answers one question:
+#
+#     has this pull request's CURRENT head SHA passed a trustworthy Claude
+#     review?
+#
+# and then acts on it as a reviewer would, by submitting a GitHub review:
+#
+#     reviewed, no blocking findings -> APPROVE
+#     reviewed, blocking findings    -> REQUEST_CHANGES
+#     not (yet) reviewed / untrusted -> dismiss any standing bot approval
+#
+# The review is submitted HERE and never by `claude-review.yml`: that workflow
+# executes from the pull request's head, so a pull request could rewrite it to
+# approve itself. This file executes from the default branch.
+#
+# Approving needs Settings -> Actions -> General -> "Allow GitHub Actions to
+# create and approve pull requests". That setting is repository-wide, so it
+# also lets a workflow ADDED by a pull request approve that pull request -- the
+# `.github/workflows/**` path restriction in docs/claude-pr-review.md is
+# therefore mandatory, not optional, once it is on.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS RUNS ON `workflow_run` AND NOTHING ELSE
+#
+# For `pull_request` events GitHub executes the workflow file from the pull
+# request's own head. A check defined that way is rewritable by the code it is
+# judging, which is fatal for a gate. `workflow_run` listeners execute the
+# DEFAULT-BRANCH copy of this file, so the logic below is always the version on
+# `main`, never the version in the branch under review.
+#
+# The pull request therefore controls only WHETHER this runs -- by way of
+# `Claude Gate Trigger` -- and never what it concludes. Suppressing the trigger
+# means the real machinery publishes no `Claude Review Gate` check for that
+# commit.
+#
+# THAT IS ONLY FAIL-CLOSED IF NOTHING ELSE CAN PUBLISH THAT CHECK NAME. A
+# same-repo pull request that both neuters the trigger AND adds its own workflow
+# can publish a forged `Claude Review Gate` success, because a `pull_request`
+# workflow added by the pull request runs from its head with a write-capable
+# token. Closing that needs a repository setting, not workflow code -- see
+# docs/claude-pr-review.md, "The one hole code cannot close".
+#
+# The remaining lever would be to rewrite `claude-review.yml` so the expensive
+# review always succeeds. The integrity check below closes that: an approval is
+# only honoured when the review machinery at the reviewed commit is byte
+# identical to the base branch.
+# ---------------------------------------------------------------------------
+#
+# Mark THIS check required in branch protection: `Claude Review Gate`.
+name: Claude Review Gate
+
+on:
+  workflow_run:
+    workflows: ["Claude Gate Trigger", "Claude Review"]
+    types: [completed]
+
+# Keyed on the commit being evaluated. Safe to supersede -- this workflow is
+# cheap, idempotent, and never runs Claude, so it can never cancel a review.
+concurrency:
+  group: claude-gate-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Evaluate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # read workflow files at the reviewed and base commits
+      pull-requests: write # resolve the PR for the commit; approve / request changes / dismiss
+      actions: read # read Claude Review run metadata -- the approval record
+      checks: write # publish the gate verdict
+    steps:
+      - name: Evaluate and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # Set when a stale approval could not be dismissed. That failure is
+          # fail-OPEN (the approval keeps counting), so the job fails loudly.
+          DISMISS_FAILED=false
+
+          # Submit the bot's GitHub review: $1 PR, $2 sha, $3 approve|request|dismiss, $4 body.
+          # Idempotent: the gate re-runs on every push to the base branch, and
+          # must not stack a fresh approval on every open pull request each time.
+          review() {
+            local PR="$1" SHA="$2" WANT="$3" BODY="$4" LAST_STATE LAST_SHA id
+            if ! gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+                 | jq -s '(add // []) | map(select(.user.login == "github-actions[bot]"))' \
+                 > "$RUNNER_TEMP/bot-reviews-$PR.json"; then
+              echo "::error::Could not list reviews on PR $PR."
+              [ "$WANT" = dismiss ] && DISMISS_FAILED=true
+              return 0
+            fi
+            LAST_STATE=$(jq -r '[.[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state // "NONE"' "$RUNNER_TEMP/bot-reviews-$PR.json")
+            LAST_SHA=$(jq -r '[.[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .commit_id // ""' "$RUNNER_TEMP/bot-reviews-$PR.json")
+
+            case "$WANT" in
+              approve|request)
+                local EVENT=APPROVE STATE=APPROVED
+                [ "$WANT" = request ] && EVENT=REQUEST_CHANGES STATE=CHANGES_REQUESTED
+                if [ "$LAST_STATE" = "$STATE" ] && [ "$LAST_SHA" = "$SHA" ]; then
+                  echo "  review: already $STATE at ${SHA:0:9}"
+                  return 0
+                fi
+                # Narrow the race with a push that lands while this runs: never
+                # approve a commit that is no longer the head. (Dismiss-stale on
+                # the ruleset is the backstop for what remains.)
+                if [ "$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')" != "$SHA" ]; then
+                  echo "  review: head moved past ${SHA:0:9}; not submitting"
+                  return 0
+                fi
+                if gh api -X POST "repos/$REPO/pulls/$PR/reviews" \
+                     -f commit_id="$SHA" -f event="$EVENT" -f body="$BODY" >/dev/null; then
+                  echo "  review: $EVENT at ${SHA:0:9}"
+                else
+                  # Not submitting an approval fails closed; say why it happened.
+                  echo "::warning::Could not submit $EVENT on PR $PR. If this is a 422/403, enable 'Allow GitHub Actions to create and approve pull requests'."
+                fi
+                ;;
+              dismiss)
+                for id in $(jq -r '.[] | select(.state == "APPROVED") | .id' "$RUNNER_TEMP/bot-reviews-$PR.json"); do
+                  if gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
+                       -f message="$BODY" -f event=DISMISS >/dev/null; then
+                    echo "  review: dismissed approval $id"
+                  else
+                    echo "::error::Could not dismiss stale approval $id on PR $PR."
+                    DISMISS_FAILED=true
+                  fi
+                done
+                ;;
+            esac
+          }
+
+          # The review text Claude wrote for run $1 (empty if unavailable). Only
+          # the text comes from the artifact; the decision never does.
+          review_body() {
+            local d="$RUNNER_TEMP/body-$1"
+            rm -rf "$d"
+            gh run download "$1" --repo "$REPO" -n claude-review-body -D "$d" >/dev/null 2>&1 \
+              && cat "$d/body.md" 2>/dev/null || true
+          }
+
+          publish() {
+            gh api -X POST "repos/$REPO/check-runs" \
+              -f name="Claude Review Gate" \
+              -f head_sha="$1" \
+              -f status="completed" \
+              -f conclusion="$2" \
+              -f output[title]="$3" \
+              -f output[summary]="$4" >/dev/null
+            echo "  -> $2: $3"
+          }
+
+          # Evaluate one pull request: $1 number, $2 head sha, $3 base ref.
+          evaluate() {
+            local PR="$1" SHA="$2" BASE="$3"
+            echo "Evaluating PR $PR at ${SHA:0:9} against $BASE"
+
+            # --- the head must belong to exactly one open pull request --------
+            # A review is recorded against a COMMIT, and the published check is
+            # keyed on head_sha, so when several open pull requests share that
+            # commit GitHub cannot say which one was reviewed.
+            gh api "repos/$REPO/commits/$SHA/pulls" --paginate \
+              | jq -s 'add // []' > "$RUNNER_TEMP/pulls-$PR.json"
+            local COUNT
+            COUNT=$(jq --arg sha "$SHA" '[.[] | select(.state == "open" and .head.sha == $sha)] | length' \
+                     "$RUNNER_TEMP/pulls-$PR.json")
+            if [ "$COUNT" -ne 1 ]; then
+              publish "$SHA" failure "This commit is the head of $COUNT open pull requests" \
+                "GitHub cannot say which pull request a review was performed for when several share a head commit. Leave a single open pull request for this branch, then re-review."
+              review "$PR" "$SHA" dismiss "Claude approval withdrawn: this commit is the head of several open pull requests."
+              return
+            fi
+
+            # --- 1. integrity of the review machinery ------------------------
+            # Against the base branch TIP, not the merge base: a pull request
+            # branched before a fix to this machinery still carries the old
+            # copy, and a merge-base comparison would find it unchanged and
+            # honour a review produced by a version since found vulnerable.
+            local BASE_SHA
+            BASE_SHA=$(gh api "repos/$REPO/git/ref/heads/$BASE" --jq '.object.sha')
+
+            gh api "repos/$REPO/git/trees/$SHA?recursive=1"      > "$RUNNER_TEMP/head-tree.json"
+            gh api "repos/$REPO/git/trees/$BASE_SHA?recursive=1" > "$RUNNER_TEMP/base-tree.json"
+            local t
+            for t in head base; do
+              if [ "$(jq -r '.truncated' "$RUNNER_TEMP/$t-tree.json")" = "true" ]; then
+                publish "$SHA" failure "Repository tree too large to verify integrity" \
+                  "GitHub truncated the recursive tree listing for the $t commit, so the review machinery cannot be verified as unmodified."
+                review "$PR" "$SHA" dismiss "Claude approval withdrawn: the review machinery could not be verified."
+                return
+              fi
+            done
+
+            local FILTER='[.tree[]
+                     | select(.type == "blob")
+                     | select((.path | startswith(".github/workflows/"))
+                              or .path == ".github/CODEOWNERS"
+                              or .path == "REVIEW.md"
+                              or (.path | endswith("CLAUDE.md") or endswith("CLAUDE.local.md"))
+                              or (.path | test("(^|/)\\.claude/")))
+                     | "\(.path) \(.sha)"] | sort | .[]'
+            jq -r "$FILTER" "$RUNNER_TEMP/head-tree.json" > "$RUNNER_TEMP/head-machinery.txt"
+            jq -r "$FILTER" "$RUNNER_TEMP/base-tree.json" > "$RUNNER_TEMP/base-machinery.txt"
+
+            local CHANGED
+            CHANGED=$(comm -3 "$RUNNER_TEMP/base-machinery.txt" "$RUNNER_TEMP/head-machinery.txt" \
+                      | awk '{print $1}' | sort -u | tr '\n' ' ')
+            if [ -n "$CHANGED" ]; then
+              publish "$SHA" failure "This pull request differs from the review machinery on $BASE" \
+                "$(printf '%s\n' \
+                   "Differs from \`$BASE\`:" \
+                   "$(for f in $CHANGED; do echo "- \`$f\`"; done)" \
+                   "" \
+                   "Code under review must not alter what decides whether it passed review, and a review produced by an out-of-date copy of that machinery is not trusted either." \
+                   "" \
+                   "If this changes the machinery deliberately it needs a code owner and an administrator merge. If it is simply behind \`$BASE\`, update the branch.")"
+              review "$PR" "$SHA" dismiss "Claude approval withdrawn: this pull request differs from the review machinery on $BASE."
+              return
+            fi
+
+            # --- 2. ticket ---------------------------------------------------
+            # Pull requests with no CHES ticket in the title (designer
+            # prototypes) are not reviewed. The gate goes green so they are not
+            # stuck behind a red check, but the bot NEVER approves one and
+            # withdraws any earlier approval -- so dropping the ticket from a
+            # title cannot be used to skip review; merging still needs a human
+            # approval. Checked after integrity, so a ticketless pull request
+            # that touches the review machinery stays red.
+            local TITLE
+            TITLE=$(jq -r --arg sha "$SHA" '[.[] | select(.state == "open" and .head.sha == $sha)][0].title // ""' \
+                     "$RUNNER_TEMP/pulls-$PR.json")
+            if ! grep -qiE 'CHES-[0-9]+' <<<"$TITLE"; then
+              publish "$SHA" success "Skipped — no CHES ticket in the title" \
+                "Claude does not review pull requests without a \`CHES-<n>\` ticket in the title (e.g. design prototypes). This pull request needs a human review to merge. Add a ticket to the title to start a Claude review."
+              review "$PR" "$SHA" dismiss "Claude approval withdrawn: the title no longer carries a CHES ticket, so this pull request needs a human review."
+              return
+            fi
+
+            # --- 3. the approval record --------------------------------------
+            # A successful review whose ANCHOR names this pull request, this head
+            # commit AND this base branch. The anchor is a step name, evaluated
+            # at run start and stored per attempt; `pull_requests[]` is NOT used
+            # because it lists only OPEN pull requests, so closing one erases
+            # every approval recorded against it.
+            #
+            # Bound to the base REF, not the base SHA -- like a human approval,
+            # it survives `main` advancing but not a retarget. Binding the SHA
+            # would dismiss every approval on every merge to `main`, with
+            # nothing to re-trigger the reviews.
+            local WANT="context pr=$PR head=$SHA ref=$BASE "
+            gh api "repos/$REPO/actions/workflows/claude-review.yml/runs?head_sha=$SHA&per_page=100" \
+              --paginate | jq -s '{workflow_runs: (map(.workflow_runs) | add // [])}' \
+              > "$RUNNER_TEMP/runs.json"
+
+            local VERDICT="none" VERDICT_RUN="" rid attempts k RESP CTX STEP
+            while read -r rid attempts; do
+              [ -n "$rid" ] || continue
+              for k in $(seq 1 "${attempts:-1}"); do
+                if ! RESP=$(gh api "repos/$REPO/actions/runs/$rid/attempts/$k/jobs" 2>/dev/null); then
+                  publish "$SHA" failure "Could not read review history" \
+                    "Reading attempt $k of run $rid failed, so the approval record for \`${SHA:0:9}\` cannot be established. Re-run this check."
+                  review "$PR" "$SHA" dismiss "Claude approval withdrawn: the review history could not be read."
+                  return
+                fi
+                CTX=$(jq -r '[.jobs[].steps[]? | select(.name | startswith("context ")) | .name] | first // ""' <<<"$RESP")
+                case "$CTX" in "$WANT"*) ;; *) continue ;; esac
+                STEP=$(jq -r '[.jobs[].steps[]? | select(.name == "Verdict: no blocking findings") | .conclusion] | first // "absent"' <<<"$RESP")
+                case "$STEP" in
+                  failure) VERDICT="failure"; VERDICT_RUN="$rid"; break 2 ;;
+                  success) VERDICT="success"; VERDICT_RUN="$rid" ;;
+                esac
+              done
+            done <<<"$(jq -r '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"' "$RUNNER_TEMP/runs.json")"
+
+            local RUNS_URL="https://github.com/$REPO/pull/$PR/checks" BODY=""
+            [ -n "$VERDICT_RUN" ] && BODY=$(review_body "$VERDICT_RUN")
+            local FOOTER
+            FOOTER=$(printf '%s\n' "" "---" "_Automated Claude review of \`${SHA:0:9}\`. A new push withdraws this review's approval and triggers a fresh one. [Checks]($RUNS_URL)_")
+            case "$VERDICT" in
+              success)
+                publish "$SHA" success "Reviewed, no blocking issues at ${SHA:0:8}" \
+                  "A \`Claude Review\` run found no blocking issues in this commit (base \`$BASE\`), and the review machinery matches \`$BASE\`."
+                review "$PR" "$SHA" approve "${BODY:-## Approving — no blocking issues found}$FOOTER"
+                ;;
+              failure)
+                publish "$SHA" failure "Blocking issues found at ${SHA:0:8}" \
+                  "Claude found blocking issues in \`${SHA:0:9}\`. Fix the \`[blocking]\` comments and push; the new commit is reviewed automatically."
+                review "$PR" "$SHA" request "${BODY:-## Requesting changes — see the inline [blocking] comments}$FOOTER"
+                ;;
+              *)
+                publish "$SHA" failure "Claude review pending for current head SHA" \
+                  "$(printf '%s\n' \
+                     "No completed review for \`${SHA:0:9}\` against \`$BASE\` yet (latest verdict: **$VERDICT**)." \
+                     "" \
+                     "A review starts automatically on every push to a non-draft pull request. If it failed for an infrastructure reason (timeout, usage limit), add the \`claude-review\` label to retry.")"
+                review "$PR" "$SHA" dismiss "Claude approval withdrawn: new commit ${SHA:0:9} has not been reviewed yet. A review is running."
+                ;;
+            esac
+          }
+
+          # ---- dispatch -----------------------------------------------------
+          # A push to the default branch re-evaluates EVERY open pull request
+          # targeting it. GitHub fires no pull_request event when a base branch
+          # advances, so without this a green gate would stand over a base the
+          # review never saw.
+          if [ "$RUN_EVENT" = "push" ] && [ "$RUN_BRANCH" = "$DEFAULT_BRANCH" ]; then
+            echo "$DEFAULT_BRANCH advanced — re-evaluating every open pull request targeting it."
+            gh api "repos/$REPO/pulls?state=open&base=$DEFAULT_BRANCH&per_page=100" --paginate \
+              | jq -s 'add // []' > "$RUNNER_TEMP/open.json"
+            COUNT=$(jq 'length' "$RUNNER_TEMP/open.json")
+            echo "Open pull requests to re-evaluate: $COUNT"
+            while read -r n sha base; do
+              [ -n "$n" ] || continue
+              evaluate "$n" "$sha" "$base"
+            done <<<"$(jq -r '.[] | "\(.number) \(.head.sha) \(.base.ref)"' "$RUNNER_TEMP/open.json")"
+            [ "$DISMISS_FAILED" = false ] || exit 1
+            exit 0
+          fi
+
+          # Otherwise: the single pull request whose head is the triggering commit.
+          gh api "repos/$REPO/commits/$RUN_HEAD/pulls" --paginate | jq -s 'add // []' > "$RUNNER_TEMP/pulls.json"
+          PR=$(jq -r --arg sha "$RUN_HEAD" '[.[] | select(.state == "open" and .head.sha == $sha)][0].number // empty' "$RUNNER_TEMP/pulls.json")
+          if [ -z "$PR" ]; then
+            echo "No open pull request whose head is $RUN_HEAD — nothing to gate."
+            exit 0
+          fi
+          BASE=$(jq -r --arg sha "$RUN_HEAD" '[.[] | select(.state == "open" and .head.sha == $sha)][0].base.ref' "$RUNNER_TEMP/pulls.json")
+          evaluate "$PR" "$RUN_HEAD" "$BASE"
+          [ "$DISMISS_FAILED" = false ] || exit 1

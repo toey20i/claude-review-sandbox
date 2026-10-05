@@ -1,0 +1,46 @@
+# Claude Gate Trigger — a deliberately trivial workflow whose only purpose is to
+# fire on pull-request activity so that `Claude Review Gate` can run from the
+# DEFAULT BRANCH via `workflow_run`.
+#
+# Why this exists. For `pull_request` events GitHub executes the workflow file
+# taken from the pull request's own head, so any check defined that way can be
+# rewritten by the very code it is judging. `workflow_run` listeners execute the
+# default-branch copy instead. Splitting the trigger from the logic is what lets
+# the gate's decision live on trusted ground.
+#
+# This file is PR-controlled: it decides only WHETHER the gate runs, never what
+# the gate concludes. Deleting or breaking it means the real machinery publishes
+# no `Claude Review Gate` check for that commit, and a required check that never
+# reports blocks the merge.
+#
+# That is fail-closed ONLY while nothing else can publish that check name. A
+# pull request that neuters this file AND adds its own workflow can publish a
+# forged success. Closing that needs a repository setting -- see
+# docs/claude-pr-review.md, "The one hole code cannot close".
+name: Claude Gate Trigger
+
+on:
+  # A push to the default branch fires NO pull_request event on open pull
+  # requests, so without this nothing re-evaluates them when `main` advances and
+  # a previously green gate stays green over a base it was never reviewed
+  # against. Verified: before this was added, every run of this workflow had
+  # event=pull_request and none had event=push.
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` is here for one reason: GitHub fires it when a pull request's
+    # BASE BRANCH is retargeted, and a retarget changes what the diff means
+    # without changing the head SHA -- so no `synchronize` fires and a prior
+    # approval would otherwise stand over content that was never reviewed.
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+
+permissions: {}
+
+jobs:
+  trigger:
+    name: Claude Gate Trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Signal
+        run: echo "Requesting gate evaluation for ${{ github.event.pull_request.head.sha }}"
