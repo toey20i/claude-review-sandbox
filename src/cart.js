@@ -12,3 +12,4 @@ function applyDiscount(totalCents, percent) {
 }
 
 module.exports = { subtotal, applyDiscount };
+// retarget scenario
