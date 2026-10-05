@@ -302,7 +302,7 @@ jobs:
                   "$(printf '%s\n' \
                      "No completed review for \`${SHA:0:9}\` against \`$BASE\` yet (latest verdict: **$VERDICT**)." \
                      "" \
-                     "A review starts automatically on every push to a non-draft pull request. If it failed for an infrastructure reason (timeout, usage limit), add the \`claude-review\` label to retry.")"
+                     "A review starts automatically on every push to a non-draft pull request, once every other check has passed — Claude reviews last. If a check failed, fix it and push. If the review failed for an infrastructure reason (timeout, usage limit) or a flaky check was re-run to green, add the \`claude-review\` label to retry.")"
                 review "$PR" "$SHA" dismiss "Claude approval withdrawn: new commit ${SHA:0:9} has not been reviewed yet. A review is running."
                 ;;
             esac

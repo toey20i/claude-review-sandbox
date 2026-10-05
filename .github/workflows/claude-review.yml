@@ -60,7 +60,9 @@ jobs:
     # workflow files have. A timeout is an infrastructure outcome, not a verdict,
     # so it is retryable and cannot brick a commit -- but it wastes a full run's
     # subscription usage, so give it headroom.
-    timeout-minutes: 50
+    # Includes up to 40 minutes waiting for the other checks (see "Wait for the
+    # other checks" below) on top of the review itself.
+    timeout-minutes: 90
 
     # JOB-level concurrency, deliberately. At workflow level, a run triggered by
     # an unrelated label would join the group before the `if` is evaluated and
@@ -198,6 +200,64 @@ jobs:
               [ "$PRIOR" = "none" ] || echo "Previous attempt ended as '$PRIOR' (not a review verdict); retrying."
               ;;
           esac
+
+      # CLAUDE REVIEWS LAST. Wait for every other workflow run on this commit
+      # (CI, labeler, ...) to finish, and stop before spending any Claude usage
+      # if one of them did not pass. Stopping here is an infrastructure outcome,
+      # not a verdict: the commit is left unreviewed and the gate withholds
+      # approval. Fix and push -- or, after re-running a flaky check to green,
+      # add the `claude-review` label.
+      #
+      # Done as a wait inside this `pull_request` job rather than by chaining
+      # on CI's completion with `workflow_run`: a `workflow_run` job executes
+      # the default-branch copy WITH secrets, including for fork pull requests,
+      # which is exactly the context this job must not check out untrusted code
+      # in. Waiting costs runner minutes, not Claude usage.
+      #
+      # Workflow runs, not check runs: every workflow triggered by the push is
+      # registered as a run at event time, whereas a job's check run may not
+      # exist until its `needs` are met.
+      - name: Wait for the other checks
+        if: steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sleep 20 # let sibling runs from the same event register
+          DEADLINE=$(( $(date +%s) + 40 * 60 ))
+          while :; do
+            gh api "repos/${{ github.repository }}/actions/runs?head_sha=$HEAD_SHA&per_page=100" --paginate \
+              | jq -s '[.[].workflow_runs[]
+                        | select(.path | test("^\\.github/workflows/claude-") | not)
+                        | {name, status, conclusion, id, url: .html_url}]
+                       # keep the latest attempt of each workflow
+                       | group_by(.name) | map(max_by(.id))' > "$RUNNER_TEMP/others.json"
+            PENDING=$(jq '[.[] | select(.status != "completed")] | length' "$RUNNER_TEMP/others.json")
+            FAILED=$(jq -r '[.[] | select(.status == "completed"
+                                  and (.conclusion | IN("success", "skipped", "neutral") | not))
+                             | "\(.name) (\(.conclusion))"] | join(", ")' "$RUNNER_TEMP/others.json")
+            if [ -n "$FAILED" ]; then
+              echo "::error::Other checks did not pass: $FAILED. Not reviewing $HEAD_SHA."
+              {
+                echo "## Claude Review — waiting on other checks"
+                echo ""
+                echo "Claude reviews last, and only once every other check has passed. These did not: $FAILED."
+                echo ""
+                echo "Fix and push — the new commit is reviewed automatically. If a check was flaky, re-run it to green, then add the \`claude-review\` label."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$PENDING" -eq 0 ]; then
+              echo "All other checks passed: $(jq -r 'map(.name) | join(", ")' "$RUNNER_TEMP/others.json")"
+              break
+            fi
+            if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+              echo "::error::Other checks still running after 40 minutes. Not reviewing $HEAD_SHA."
+              exit 1
+            fi
+            echo "Waiting on $PENDING other check(s): $(jq -r '[.[] | select(.status != "completed") | .name] | join(", ")' "$RUNNER_TEMP/others.json")"
+            sleep 30
+          done
 
       # `pull_request`, NOT `pull_request_target`: the latter would run with
       # repository secrets against an untrusted head. Fork PRs therefore get no
