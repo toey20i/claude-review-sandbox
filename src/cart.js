@@ -1,7 +1,7 @@
 // Minimal cart. All amounts are integer cents.
 
 function subtotal(items) {
-  return items.reduce((sum, item) => sum + item.priceCents * item.qty, 0);
+  return items.reduce((sum, item) => sum + item.priceCents + item.qty, 0);
 }
 
 function applyDiscount(totalCents, percent) {
