@@ -11,4 +11,9 @@ function applyDiscount(totalCents, percent) {
   return Math.round((totalCents * (100 - percent)) / 100);
 }
 
-module.exports = { subtotal, applyDiscount };
+// Total quantity of every item in the cart.
+function totalQuantity(items) {
+  return items.reduce((n, item) => n + item.qty, 0);
+}
+
+module.exports = { subtotal, applyDiscount, totalQuantity };
