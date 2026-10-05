@@ -80,6 +80,7 @@ jobs:
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
@@ -284,11 +285,21 @@ jobs:
             # would dismiss every approval on every merge to `main`, with
             # nothing to re-trigger the reviews.
             local WANT="context pr=$PR head=$SHA ref=$BASE "
-            gh api "repos/$REPO/actions/workflows/claude-review.yml/runs?head_sha=$SHA&per_page=100" \
-              --paginate | jq -s '{workflow_runs: (map(.workflow_runs) | add // [])}' \
-              > "$RUNNER_TEMP/runs.json"
+            # Runs recorded against this commit, plus comment-triggered runs
+            # since it was made (an issue_comment run is recorded against the
+            # default branch's commit). Oldest first: a push/label failure is
+            # sticky, but a NEWER reply-triggered verdict overrides it.
+            local SINCE
+            SINCE=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.committer.date')
+            { gh api "repos/$REPO/actions/workflows/claude-review.yml/runs?head_sha=$SHA&per_page=100" --paginate \
+                --jq '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"'
+              local ev
+              for ev in issue_comment pull_request_review_comment; do
+                gh api "repos/$REPO/actions/workflows/claude-review.yml/runs?event=$ev&created=%3E%3D$SINCE&per_page=100" --paginate \
+                  --jq '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"'
+              done; } | sort -n -u > "$RUNNER_TEMP/runs-$PR.txt"
 
-            local VERDICT="none" VERDICT_RUN="" rid attempts k RESP CTX STEP
+            local VERDICT="none" VERDICT_RUN="" rid attempts k RESP CTX STEP T
             while read -r rid attempts; do
               [ -n "$rid" ] || continue
               for k in $(seq 1 "${attempts:-1}"); do
@@ -300,13 +311,16 @@ jobs:
                 fi
                 CTX=$(jq -r '[.jobs[].steps[]? | select(.name | startswith("context ")) | .name] | first // ""' <<<"$RESP")
                 case "$CTX" in "$WANT"*) ;; *) continue ;; esac
+                T=$(sed -n 's/.* trigger=\([a-z]*\).*/\1/p' <<<"$CTX"); T=${T:-push}
                 STEP=$(jq -r '[.jobs[].steps[]? | select(.name == "Verdict: no blocking findings") | .conclusion] | first // "absent"' <<<"$RESP")
-                case "$STEP" in
-                  failure) VERDICT="failure"; VERDICT_RUN="$rid"; break 2 ;;
-                  success) VERDICT="success"; VERDICT_RUN="$rid" ;;
+                case "$T:$STEP" in
+                  reply:success) VERDICT="success"; VERDICT_RUN="$rid" ;;
+                  reply:failure) VERDICT="failure"; VERDICT_RUN="$rid" ;;
+                  *:failure)     VERDICT="failure"; VERDICT_RUN="$rid" ;;
+                  *:success)     [ "$VERDICT" = failure ] || { VERDICT="success"; VERDICT_RUN="$rid"; } ;;
                 esac
               done
-            done <<<"$(jq -r '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"' "$RUNNER_TEMP/runs.json")"
+            done < "$RUNNER_TEMP/runs-$PR.txt"
 
             local RUNS_URL="https://github.com/$REPO/pull/$PR/checks" BODY=""
             [ -n "$VERDICT_RUN" ] && BODY=$(review_body "$VERDICT_RUN")
@@ -370,7 +384,20 @@ jobs:
           gh api "repos/$REPO/commits/$RUN_HEAD/pulls" --paginate | jq -s 'add // []' > "$RUNNER_TEMP/pulls.json"
           PR=$(jq -r --arg sha "$RUN_HEAD" '[.[] | select(.state == "open" and .head.sha == $sha)][0].number // empty' "$RUNNER_TEMP/pulls.json")
           if [ -z "$PR" ]; then
-            echo "No open pull request whose head is $RUN_HEAD — nothing to gate."
+            # A comment-triggered review is recorded against the default
+            # branch's commit, so find its pull request from the run's own
+            # anchor and evaluate that pull request's CURRENT head.
+            PR=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+                   --jq '[.jobs[].steps[]? | select(.name | startswith("context ")) | .name] | first // ""' \
+                 | sed -n 's/^context pr=\([0-9][0-9]*\) .*/\1/p')
+            if [ -z "$PR" ]; then
+              echo "No open pull request whose head is $RUN_HEAD, and no review anchor — nothing to gate."
+              exit 0
+            fi
+            gh api "repos/$REPO/pulls/$PR" > "$RUNNER_TEMP/pr-$PR.json"
+            jq -e '.state == "open"' "$RUNNER_TEMP/pr-$PR.json" >/dev/null || { echo "PR $PR is not open."; exit 0; }
+            evaluate "$PR" "$(jq -r '.head.sha' "$RUNNER_TEMP/pr-$PR.json")" "$(jq -r '.base.ref' "$RUNNER_TEMP/pr-$PR.json")"
+            [ "$DISMISS_FAILED" = false ] || exit 1
             exit 0
           fi
           BASE=$(jq -r --arg sha "$RUN_HEAD" '[.[] | select(.state == "open" and .head.sha == $sha)][0].base.ref' "$RUNNER_TEMP/pulls.json")
