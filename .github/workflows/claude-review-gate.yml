@@ -97,7 +97,7 @@ jobs:
                  | jq -s '(add // []) | map(select(.user.login == "github-actions[bot]"))' \
                  > "$RUNNER_TEMP/bot-reviews-$PR.json"; then
               echo "::error::Could not list reviews on PR $PR."
-              [ "$WANT" = dismiss ] && DISMISS_FAILED=true
+              case "$WANT" in dismiss*) DISMISS_FAILED=true ;; esac
               return 0
             fi
             LAST_STATE=$(jq -r '[.[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state // "NONE"' "$RUNNER_TEMP/bot-reviews-$PR.json")
@@ -126,13 +126,19 @@ jobs:
                   echo "::warning::Could not submit $EVENT on PR $PR. If this is a 422/403, enable 'Allow GitHub Actions to create and approve pull requests'."
                 fi
                 ;;
-              dismiss)
-                for id in $(jq -r '.[] | select(.state == "APPROVED") | .id' "$RUNNER_TEMP/bot-reviews-$PR.json"); do
+              dismiss|dismiss_all)
+                # dismiss: withdraw approvals (a standing request-changes stays
+                # until a newer verdict replaces it). dismiss_all: also withdraw
+                # request-changes -- for paths where the bot no longer has a say
+                # (ticketless, machinery changed, ambiguous head).
+                local STATES='"APPROVED"'
+                [ "$WANT" = dismiss_all ] && STATES='"APPROVED","CHANGES_REQUESTED"'
+                for id in $(jq -r ".[] | select(.state | IN($STATES)) | .id" "$RUNNER_TEMP/bot-reviews-$PR.json"); do
                   if gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
                        -f message="$BODY" -f event=DISMISS >/dev/null; then
-                    echo "  review: dismissed approval $id"
+                    echo "  review: dismissed review $id"
                   else
-                    echo "::error::Could not dismiss stale approval $id on PR $PR."
+                    echo "::error::Could not dismiss stale review $id on PR $PR."
                     DISMISS_FAILED=true
                   fi
                 done
@@ -197,7 +203,7 @@ jobs:
             if [ "$COUNT" -ne 1 ]; then
               publish "$SHA" failure "This commit is the head of $COUNT open pull requests" \
                 "GitHub cannot say which pull request a review was performed for when several share a head commit. Leave a single open pull request for this branch, then re-review."
-              review "$PR" "$SHA" dismiss "Claude approval withdrawn: this commit is the head of several open pull requests."
+              review "$PR" "$SHA" dismiss_all "Claude review withdrawn: this commit is the head of several open pull requests."
               return
             fi
 
@@ -216,7 +222,7 @@ jobs:
               if [ "$(jq -r '.truncated' "$RUNNER_TEMP/$t-tree.json")" = "true" ]; then
                 publish "$SHA" failure "Repository tree too large to verify integrity" \
                   "GitHub truncated the recursive tree listing for the $t commit, so the review machinery cannot be verified as unmodified."
-                review "$PR" "$SHA" dismiss "Claude approval withdrawn: the review machinery could not be verified."
+                review "$PR" "$SHA" dismiss_all "Claude review withdrawn: the review machinery could not be verified."
                 return
               fi
             done
@@ -244,7 +250,7 @@ jobs:
                    "Code under review must not alter what decides whether it passed review, and a review produced by an out-of-date copy of that machinery is not trusted either." \
                    "" \
                    "If this changes the machinery deliberately it needs a code owner and an administrator merge. If it is simply behind \`$BASE\`, update the branch.")"
-              review "$PR" "$SHA" dismiss "Claude approval withdrawn: this pull request differs from the review machinery on $BASE."
+              review "$PR" "$SHA" dismiss_all "Claude review withdrawn: this pull request differs from the review machinery on $BASE."
               return
             fi
 
@@ -262,7 +268,7 @@ jobs:
             if ! grep -qiE 'CHES-[0-9]+' <<<"$TITLE"; then
               publish "$SHA" success "Skipped — no CHES ticket in the title" \
                 "Claude does not review pull requests without a \`CHES-<n>\` ticket in the title (e.g. design prototypes). This pull request needs a human review to merge. Add a ticket to the title to start a Claude review."
-              review "$PR" "$SHA" dismiss "Claude approval withdrawn: the title no longer carries a CHES ticket, so this pull request needs a human review."
+              review "$PR" "$SHA" dismiss_all "Claude review withdrawn: the title no longer carries a CHES ticket, so this pull request needs a human review."
               return
             fi
 

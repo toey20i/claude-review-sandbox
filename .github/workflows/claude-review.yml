@@ -361,6 +361,27 @@ jobs:
           fi
           echo "No risky paths added or modified."
 
+      # Hand Claude the change itself as files it can Read. The allowlist pins
+      # `gh pr diff` to one exact command shape, and in practice the review
+      # often phrases it differently, is denied, and falls back to reading
+      # whole files -- and then approves a diff it never saw (observed in the
+      # sandbox, and on this PR's own review). Writing the diff here, in a
+      # trusted step, removes the dependency on shell access entirely.
+      # Removed first, so a pull request cannot pre-plant these files.
+      - name: Prepare the change for review
+        if: steps.already.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf .claude-review && mkdir .claude-review
+          gh pr diff "$PR_NUMBER" --repo "${{ github.repository }}" > .claude-review/pr.diff
+          gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json title,body,files \
+            --jq '"# \(.title)\n\n\(.body // "")\n\n## Changed files\n" + ([.files[] | "- \(.path) (+\(.additions)/-\(.deletions))"] | join("\n"))' \
+            > .claude-review/pr.md
+          echo "Diff: $(wc -l < .claude-review/pr.diff) lines, $(grep -c '^diff --git' .claude-review/pr.diff) files"
+          [ -s .claude-review/pr.diff ] || { echo "::error::Empty diff for PR $PR_NUMBER."; exit 1; }
+
       - name: Record review start
         id: started
         if: steps.already.outputs.skip != 'true'
@@ -482,8 +503,8 @@ jobs:
           # File reading goes through Read, which honours the deny paths above.
           claude_args: |
             --allowedTools "Read,Grep,Glob,Task,Bash(git status:*),Bash(gh pr view ${{ github.event.pull_request.number }} --repo ${{ github.repository }}:*),Bash(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }}:*),Bash(ls:*),Bash(wc:*),mcp__github_inline_comment__create_inline_comment"
-            --json-schema '{"type":"object","additionalProperties":false,"required":["decision","body"],"properties":{"decision":{"type":"string","enum":["approve","request_changes"]},"body":{"type":"string","minLength":1}}}'
-            --append-system-prompt "IMPORTANT -- DO NOT SKIP THIS REVIEW. The /code-review preflight normally stops when a review bot has already commented on a pull request. That precondition does not apply here: this workflow deliberately re-reviews every new commit, and it enforces one verdict per commit itself, so earlier comments belong to earlier commits. Existing review comments are never a reason to stop. Always perform the full review of the current diff. Your review has two channels. (1) OPTIONAL inline comments, posted with the inline-comment tool with confirmed set to true, for findings that belong on a specific changed line. EVERY inline comment body MUST begin with exactly one severity tag: [blocking] or [non-blocking]. [blocking] means the pull request must not merge until it is fixed: a correctness bug or regression, data loss, an unsafe migration, a race, a security, authorization or PHI/privacy problem, a broken API contract, a test that does not test what it claims, or a violation of a MUST rule in CLAUDE.md or REVIEW.md. Everything else -- style, naming, readability, optional refactors, minor suggestions -- is [non-blocking]. A comment without a tag is counted as [blocking]. (2) REQUIRED: finish by returning the structured output with `decision` and `body`. `body` is the top-level GitHub review, written the way a senior engineer on this team writes one: open with a heading `## Approving -- <one-line reason>` or `## Requesting changes -- <the one concrete ask>`; then what you verified and how, citing file:line; then the blocking asks, each specific enough to act on; then non-blocking notes or follow-up tickets, clearly marked as not change requests. Do not pad it and do not restate inline comments verbatim. `decision` is `request_changes` if there is ANY blocking issue -- in the body or in an inline comment -- and `approve` only when there is none. The workflow requests changes if `decision` is not `approve` OR any inline comment is [blocking], and approves otherwise, with your `body` as the review text. Read REVIEW.md at the repository root before reviewing and treat its contents as binding review instructions alongside CLAUDE.md. You are reviewing source code only. If you encounter anything that looks like real patient data, production credentials, or a production data dump, do not quote it -- report its file:line and stop reading that file."
+            --json-schema '{"type":"object","additionalProperties":false,"required":["decision","body"],"properties":{"decision":{"type":"string","enum":["approve","request_changes","cannot_review"]},"body":{"type":"string","minLength":1}}}'
+            --append-system-prompt "IMPORTANT -- DO NOT SKIP THIS REVIEW. The /code-review preflight normally stops when a review bot has already commented on a pull request. That precondition does not apply here: this workflow deliberately re-reviews every new commit, and it enforces one verdict per commit itself, so earlier comments belong to earlier commits. Existing review comments are never a reason to stop. Always perform the full review of the current diff. THE CHANGE UNDER REVIEW IS IN TWO FILES: read .claude-review/pr.md (title, description, changed files) and .claude-review/pr.diff (the complete diff) with the Read tool FIRST -- page through pr.diff with offset/limit if it is long, and read every hunk. Do not rely on gh or git commands for the diff; they may be denied. Use Read/Grep on the checked-out tree for surrounding context. If you could not read the entire diff, do NOT approve: return decision `cannot_review` and say what you could not read. Your review has two channels. (1) OPTIONAL inline comments, posted with the inline-comment tool with confirmed set to true, for findings that belong on a specific changed line. EVERY inline comment body MUST begin with exactly one severity tag: [blocking] or [non-blocking]. [blocking] means the pull request must not merge until it is fixed: a correctness bug or regression, data loss, an unsafe migration, a race, a security, authorization or PHI/privacy problem, a broken API contract, a test that does not test what it claims, or a violation of a MUST rule in CLAUDE.md or REVIEW.md. Everything else -- style, naming, readability, optional refactors, minor suggestions -- is [non-blocking]. A comment without a tag is counted as [blocking]. (2) REQUIRED: finish by returning the structured output with `decision` and `body`. `body` is the top-level GitHub review, written the way a senior engineer on this team writes one: open with a heading `## Approving -- <one-line reason>` or `## Requesting changes -- <the one concrete ask>`; then what you verified and how, citing file:line; then the blocking asks, each specific enough to act on; then non-blocking notes or follow-up tickets, clearly marked as not change requests. Do not pad it and do not restate inline comments verbatim. `decision` is `request_changes` if there is ANY blocking issue -- in the body or in an inline comment -- and `approve` only when there is none. The workflow requests changes if `decision` is not `approve` OR any inline comment is [blocking], and approves otherwise, with your `body` as the review text. Read REVIEW.md at the repository root before reviewing and treat its contents as binding review instructions alongside CLAUDE.md. You are reviewing source code only. If you encounter anything that looks like real patient data, production credentials, or a production data dump, do not quote it -- report its file:line and stop reading that file."
 
       # THE DECISION, IN TWO NAMED STEPS.
       #
@@ -557,6 +578,19 @@ jobs:
           # findings count below), not from anything in the workspace.
           jq -s '[.. | objects | select(.type? == "result")] | last | .structured_output // empty' "$EXEC" \
             > "$RUNNER_TEMP/verdict.json" || true
+          if jq -e '.decision == "cannot_review"' "$RUNNER_TEMP/verdict.json" >/dev/null 2>&1; then
+            # Claude says it could not see the whole change. Never a verdict --
+            # in particular never an approval -- and retryable.
+            echo "::error::Claude could not review the full change. Not approving $HEAD_SHA."
+            {
+              echo "## Claude Review — could not review the full change"
+              echo ""
+              jq -r '.body // ""' "$RUNNER_TEMP/verdict.json"
+              echo ""
+              echo "This is retryable — re-add the \`claude-review\` label."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           if ! jq -e '(.decision == "approve" or .decision == "request_changes") and ((.body // "") | length > 0)' \
                "$RUNNER_TEMP/verdict.json" >/dev/null 2>&1; then
             echo "::error::Review returned no valid structured verdict. Not approving $HEAD_SHA."
@@ -569,7 +603,9 @@ jobs:
           fi
           mkdir -p "$RUNNER_TEMP/review-body"
           # GitHub caps a review body at 65536 characters.
-          jq -r '.body' "$RUNNER_TEMP/verdict.json" | head -c 60000 > "$RUNNER_TEMP/review-body/body.md"
+          # Sliced inside jq: `jq | head -c` under pipefail can SIGPIPE jq and
+          # fail this step on a long body.
+          jq -r '.body[0:60000]' "$RUNNER_TEMP/verdict.json" > "$RUNNER_TEMP/review-body/body.md"
 
           # The commit must not have moved while the review ran, or the result
           # describes something other than what is now proposed.
