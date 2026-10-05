@@ -11,4 +11,13 @@ function applyDiscount(totalCents, percent) {
   return Math.round((totalCents * (100 - percent)) / 100);
 }
 
-module.exports = { subtotal, applyDiscount };
+function itemCount(items) {
+  return items.reduce((count, item) => count + item.qty, 0);
+}
+
+// Remove the line item with the given sku and return the remaining items.
+function removeItem(items, sku) {
+  return items.filter((item) => item.sku !== sku);
+}
+
+module.exports = { subtotal, applyDiscount, itemCount, removeItem };
