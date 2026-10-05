@@ -12,3 +12,9 @@ function applyDiscount(totalCents, percent) {
 }
 
 module.exports = { subtotal, applyDiscount };
+
+// Number of distinct line items.
+function lineCount(items) {
+  return items.length;
+}
+module.exports.lineCount = lineCount;
