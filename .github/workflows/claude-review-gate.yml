@@ -149,6 +149,26 @@ jobs:
               && cat "$d/body.md" 2>/dev/null || true
           }
 
+          # Latest run of every non-Claude workflow on commit $1. Prints "pass",
+          # "pending", or "failed: <names>". Read here, from the default-branch
+          # copy, rather than trusting anything the PR-controlled run recorded.
+          other_checks() {
+            local runs
+            runs=$(gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=100" --paginate \
+              | jq -s '[.[].workflow_runs[]
+                        | select(.path | test("^\\.github/workflows/claude-") | not)
+                        | {name, status, conclusion, id}]
+                       | group_by(.name) | map(max_by(.id))') || { echo "pending"; return; }
+            local failed
+            failed=$(jq -r '[.[] | select(.status == "completed"
+                                  and (.conclusion | IN("success", "skipped", "neutral") | not))
+                             | "\(.name) (\(.conclusion))"] | join(", ")' <<<"$runs")
+            if [ -n "$failed" ]; then echo "failed: $failed"
+            elif [ "$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")" -gt 0 ]; then echo "pending"
+            else echo "pass"
+            fi
+          }
+
           publish() {
             gh api -X POST "repos/$REPO/check-runs" \
               -f name="Claude Review Gate" \
@@ -286,6 +306,19 @@ jobs:
             [ -n "$VERDICT_RUN" ] && BODY=$(review_body "$VERDICT_RUN")
             local FOOTER
             FOOTER=$(printf '%s\n' "" "---" "_Automated Claude review of \`${SHA:0:9}\`. A new push withdraws this review's approval and triggers a fresh one. [Checks]($RUNS_URL)_")
+            # A clean review is only approved once every other check has passed
+            # too: the review runs in parallel with CI, so it can finish first.
+            if [ "$VERDICT" = "success" ]; then
+              local CI
+              CI=$(other_checks "$SHA")
+              if [ "$CI" != "pass" ]; then
+                publish "$SHA" failure "Reviewed clean, but other checks are ${CI%%:*}" \
+                  "Claude found no blocking issues in \`${SHA:0:9}\`, but it is approved only once every other check has passed. Other checks: **$CI**."
+                review "$PR" "$SHA" dismiss "Claude approval withdrawn: other checks on ${SHA:0:9} are $CI."
+                return
+              fi
+            fi
+
             case "$VERDICT" in
               success)
                 publish "$SHA" success "Reviewed, no blocking issues at ${SHA:0:8}" \
@@ -302,7 +335,7 @@ jobs:
                   "$(printf '%s\n' \
                      "No completed review for \`${SHA:0:9}\` against \`$BASE\` yet (latest verdict: **$VERDICT**)." \
                      "" \
-                     "A review starts automatically on every push to a non-draft pull request, once every other check has passed — Claude reviews last. If a check failed, fix it and push. If the review failed for an infrastructure reason (timeout, usage limit) or a flaky check was re-run to green, add the \`claude-review\` label to retry.")"
+                     "A review starts automatically on every push to a non-draft pull request, running alongside CI; it is cancelled if any other check fails, and approval also requires every other check to pass. If a check failed, fix it and push. If the review failed for an infrastructure reason (timeout, usage limit) or a flaky check was re-run to green, add the \`claude-review\` label to retry.")"
                 review "$PR" "$SHA" dismiss "Claude approval withdrawn: new commit ${SHA:0:9} has not been reviewed yet. A review is running."
                 ;;
             esac
