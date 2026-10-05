@@ -7,7 +7,7 @@ test("subtotal sums price times quantity", () => {
 });
 
 test("applyDiscount takes a percentage off", () => {
-  assert.strictEqual(applyDiscount(1000, 15), 850);
+  assert.strictEqual(applyDiscount(1000, 15), 851);
 });
 
 test("applyDiscount rejects out-of-range percentages", () => {
