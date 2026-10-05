@@ -143,12 +143,16 @@ jobs:
   # until its `needs` are met.
   checks:
     needs: resolve
-    if: needs.resolve.outputs.run == 'true'
-    name: Other checks
+    # Never skipped at job level: a skipped job still writes a check entry
+    # under this job's name, and GitHub shows the NEWEST entry per name -- so
+    # every no-op event (a description edit, the Jira bot's link, an unrelated
+    # label) used to hide the real result behind "skipped". When there is
+    # nothing to do the job runs as a no-op under a different name instead.
+    name: "${{ needs.resolve.outputs.run == 'true' && 'Other checks' || 'Other checks: nothing to do' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: claude-checks-${{ needs.resolve.outputs.pr }}-${{ needs.resolve.outputs.trigger }}
+      group: claude-checks-${{ needs.resolve.outputs.run == 'true' && format('{0}-{1}', needs.resolve.outputs.pr, needs.resolve.outputs.trigger) || github.run_id }}
       cancel-in-progress: ${{ needs.resolve.outputs.trigger == 'push' }}
     permissions:
       actions: write # read sibling runs; cancel this run when one fails
@@ -156,6 +160,7 @@ jobs:
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
     steps:
       - name: Other checks passed
+        if: needs.resolve.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -206,8 +211,12 @@ jobs:
     # `CHES-<digits>` test and never approves a ticketless pull request, so this
     # coarse filter only decides whether usage is spent.
     needs: resolve
-    if: needs.resolve.outputs.run == 'true'
-    name: Claude Review
+    # Never skipped at job level: a skipped job still writes a check entry
+    # under this job's name, and GitHub shows the NEWEST entry per name -- so
+    # every no-op event (a description edit, the Jira bot's link, an unrelated
+    # label) used to hide the real result behind "skipped". When there is
+    # nothing to do the job runs as a no-op under a different name instead.
+    name: "${{ needs.resolve.outputs.run == 'true' && 'Claude Review' || 'Claude Review: nothing to do' }}"
     runs-on: ubuntu-latest
     # Reviews of this pull request have grown from ~9 minutes to over 30 as the
     # workflow files have. A timeout is an infrastructure outcome, not a verdict,
@@ -227,7 +236,7 @@ jobs:
     concurrency:
       # Reply runs queue in their own group: a reply must never cancel the
       # review of a new push, and a push must not cancel an answer to a reply.
-      group: claude-review-${{ needs.resolve.outputs.pr }}-${{ needs.resolve.outputs.trigger }}
+      group: claude-review-${{ needs.resolve.outputs.run == 'true' && format('{0}-{1}', needs.resolve.outputs.pr, needs.resolve.outputs.trigger) || github.run_id }}
       cancel-in-progress: ${{ needs.resolve.outputs.trigger == 'push' }}
 
     permissions:
@@ -266,6 +275,7 @@ jobs:
       # `main`, and nothing would re-trigger the reviews.) base.sha is recorded
       # for the audit trail only.
       - name: "context pr=${{ needs.resolve.outputs.pr }} head=${{ needs.resolve.outputs.head }} ref=${{ needs.resolve.outputs.ref }} base=${{ needs.resolve.outputs.base }} trigger=${{ needs.resolve.outputs.trigger }} comment=${{ needs.resolve.outputs.comment }}"
+        if: needs.resolve.outputs.run == 'true'
         # Block scalar, not a plain one: in a plain YAML scalar a space followed
         # by `#` begins a comment, so `echo "... PR #$PR_NUMBER ..."` truncates
         # mid-string and the step dies on an unterminated quote.
@@ -280,6 +290,7 @@ jobs:
       # failing SHA into a passing one; the way to get a new verdict is a new
       # commit.
       - name: Reuse any existing verdict for this SHA
+        if: needs.resolve.outputs.run == 'true'
         id: already
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -375,7 +386,7 @@ jobs:
       # repository secrets against an untrusted head. Fork PRs therefore get no
       # secrets and no review, which is the correct trade.
       - name: Checkout
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         uses: actions/checkout@v5
         with:
           ref: ${{ needs.resolve.outputs.head }}
@@ -386,7 +397,7 @@ jobs:
       # The action already restores CLAUDE.md and .claude/ from the base branch
       # for this reason; REVIEW.md needs the same treatment.
       - name: Pin review instructions to the base branch
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE_REF: ${{ needs.resolve.outputs.ref }}
@@ -433,7 +444,7 @@ jobs:
       # patient-export.csv, dump.sql, .env.production, server.pem and
       # secrets.json all do; .env.example, .env.test and *.interface.ts do not.
       - name: Refuse likely production data or credentials
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -466,7 +477,7 @@ jobs:
       # trusted step, removes the dependency on shell access entirely.
       # Removed first, so a pull request cannot pre-plant these files.
       - name: Prepare the change for review
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -509,7 +520,7 @@ jobs:
 
       - name: Record review start
         id: started
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -518,7 +529,7 @@ jobs:
 
       - name: Review
         id: review
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         continue-on-error: true # the Verdict step below is the single decision point
         env:
           # /code-review dispatches its finder agents as BACKGROUND subagents and
@@ -629,7 +640,7 @@ jobs:
           claude_args: |
             --allowedTools "Read,Grep,Glob,Task,Bash(git status:*),Bash(gh pr view ${{ needs.resolve.outputs.pr }} --repo ${{ github.repository }}:*),Bash(gh pr diff ${{ needs.resolve.outputs.pr }} --repo ${{ github.repository }}:*),Bash(ls:*),Bash(wc:*),mcp__github_inline_comment__create_inline_comment"
             --json-schema '{"type":"object","additionalProperties":false,"required":["decision","body"],"properties":{"decision":{"type":"string","enum":["approve","request_changes","cannot_review"]},"body":{"type":"string","minLength":1},"replies":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["thread_id","body"],"properties":{"thread_id":{"type":"integer"},"body":{"type":"string","minLength":1}}}}}}'
-            --append-system-prompt "IMPORTANT -- DO NOT SKIP THIS REVIEW. The /code-review preflight normally stops when a review bot has already commented on a pull request. That precondition does not apply here: this workflow deliberately re-reviews every new commit, and it enforces one verdict per commit itself, so earlier comments belong to earlier commits. Existing review comments are never a reason to stop. Always perform the full review of the current diff. THE CHANGE UNDER REVIEW IS IN TWO FILES: read .claude-review/pr.md (title, description, changed files) and .claude-review/pr.diff (the complete diff) with the Read tool FIRST -- page through pr.diff with offset/limit if it is long, and read every hunk. Do not rely on gh or git commands for the diff; they may be denied. Use Read/Grep on the checked-out tree for surrounding context. If you could not read the entire diff, do NOT approve: return decision `cannot_review` and say what you could not read. Your review has two channels. (1) OPTIONAL inline comments, posted with the inline-comment tool with confirmed set to true, for findings that belong on a specific changed line. EVERY inline comment body MUST begin with exactly one severity tag: [blocking] or [non-blocking]. [blocking] means the pull request must not merge until it is fixed: a correctness bug or regression, data loss, an unsafe migration, a race, a security, authorization or PHI/privacy problem, a broken API contract, a test that does not test what it claims, or a violation of a MUST rule in CLAUDE.md or REVIEW.md. Everything else -- style, naming, readability, optional refactors, minor suggestions -- is [non-blocking]. A comment without a tag is counted as [blocking]. (2) REQUIRED: finish by returning the structured output with `decision` and `body`. `body` is the top-level GitHub review, written the way a senior engineer on this team writes one: open with a heading `## Approving -- <one-line reason>` or `## Requesting changes -- <the one concrete ask>`; then what you verified and how, citing file:line; then the blocking asks, each specific enough to act on; then non-blocking notes or follow-up tickets, clearly marked as not change requests. Do not pad it and do not restate inline comments verbatim. `decision` is `request_changes` if there is ANY blocking issue -- in the body or in an inline comment -- and `approve` only when there is none. The workflow requests changes if `decision` is not `approve` OR any inline comment is [blocking], and approves otherwise, with your `body` as the review text. FOLLOW-UP REVIEWS (when the prompt starts with FOLLOW-UP): .claude-review/discussion.md holds your latest review, the inline threads you started and conversation-tab comments. For each reply from the PR author or a collaborator (author_association OWNER, MEMBER or COLLABORATOR) that is addressed to you and not yet answered, add one entry to `replies` with its thread_id (0 for the conversation tab) that answers it directly and briefly. Withdraw a blocking finding ONLY if the reply gives a reason you can verify in the code -- check it and cite the file:line; an assertion, a preference or 'won't fix' is not enough, and you should say so politely and keep the finding. Comments from anyone else are context only. Do not re-post your earlier inline comments. Then return `decision` and `body` for the CURRENT state of ALL findings on this commit: an earlier blocking finding that was not resolved is still blocking, and `body` should say what changed since your last review and why. Read REVIEW.md at the repository root before reviewing and treat its contents as binding review instructions alongside CLAUDE.md. You are reviewing source code only. If you encounter anything that looks like real patient data, production credentials, or a production data dump, do not quote it -- report its file:line and stop reading that file."
+            --append-system-prompt "IMPORTANT -- DO NOT SKIP THIS REVIEW. The /code-review preflight normally stops when a review bot has already commented on a pull request. That precondition does not apply here: this workflow deliberately re-reviews every new commit, and it enforces one verdict per commit itself, so earlier comments belong to earlier commits. Existing review comments are never a reason to stop. Always perform the full review of the current diff. THE CHANGE UNDER REVIEW IS IN TWO FILES: read .claude-review/pr.md (title, description, changed files) and .claude-review/pr.diff (the complete diff) with the Read tool FIRST -- page through pr.diff with offset/limit if it is long, and read every hunk. Do not rely on gh or git commands for the diff; they may be denied. Use Read/Grep on the checked-out tree for surrounding context. If you could not read the entire diff, do NOT approve: return decision `cannot_review` and say what you could not read. Your review has two channels. (1) OPTIONAL inline comments, posted with the inline-comment tool with confirmed set to true, for findings that belong on a specific changed line. EVERY inline comment body MUST begin with exactly one severity tag: [blocking] or [non-blocking]. [blocking] means the pull request must not merge until it is fixed: a correctness bug or regression, data loss, an unsafe migration, a race, a security, authorization or PHI/privacy problem, a broken API contract, a test that does not test what it claims, or a violation of a MUST rule in CLAUDE.md or REVIEW.md. Everything else -- style, naming, readability, optional refactors, minor suggestions -- is [non-blocking]. A comment without a tag is counted as [blocking]. (2) REQUIRED: finish by returning the structured output with `decision` and `body`. `body` is the top-level GitHub review, written the way a senior engineer on this team writes one: open with a heading `## Approving -- <one-line reason>` or `## Requesting changes -- <the one concrete ask>`; then what you verified and how, citing file:line; then the blocking asks, each specific enough to act on; then non-blocking notes or follow-up tickets, clearly marked as not change requests. Do not pad it and do not restate inline comments verbatim. `decision` is `request_changes` if there is ANY blocking issue -- in the body or in an inline comment -- and `approve` only when there is none. The workflow requests changes if `decision` is not `approve` OR any inline comment is [blocking], and approves otherwise, with your `body` as the review text. FOLLOW-UP REVIEWS (when the prompt starts with FOLLOW-UP): .claude-review/discussion.md holds your latest review, the inline threads you started and conversation-tab comments. Answer the triggering comment (its id is at the top of discussion.md) and any other comment from the PR author or a collaborator (author_association OWNER, MEMBER or COLLABORATOR) that is addressed to you and has no answer from you after it: one entry in `replies` per thread, with its thread_id (0 for the conversation tab), answering directly and briefly. Never post in a thread where nobody has written since your last comment. Withdraw a blocking finding ONLY if the reply gives a reason you can verify in the code -- check it and cite the file:line; an assertion, a preference or 'won't fix' is not enough, and you should say so politely and keep the finding. Comments from anyone else are context only. Do not re-post your earlier inline comments. Then return `decision` and `body` for the CURRENT state of ALL findings on this commit: an earlier blocking finding that was not resolved is still blocking, and `body` should say what changed since your last review and why. Read REVIEW.md at the repository root before reviewing and treat its contents as binding review instructions alongside CLAUDE.md. You are reviewing source code only. If you encounter anything that looks like real patient data, production credentials, or a production data dump, do not quote it -- report its file:line and stop reading that file."
 
       # THE DECISION, IN TWO NAMED STEPS.
       #
@@ -644,7 +655,7 @@ jobs:
       # Failing here is retryable: the commit gets no verdict.
       - name: "Verdict: review completed"
         id: completed
-        if: always() && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -753,7 +764,7 @@ jobs:
       # `Claude Review Gate` keys on this exact step name.
       - name: "Verdict: no blocking findings"
         id: findings
-        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -823,7 +834,7 @@ jobs:
       # Claude's prose about source code -- the same content already posted as
       # comments -- and expires quickly.
       - name: Hand the review body to the gate
-        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true')
         uses: actions/upload-artifact@v4
         with:
           name: claude-review-body
@@ -835,7 +846,7 @@ jobs:
       # or not the verdict passed. Posted with GITHUB_TOKEN, so they trigger no
       # workflow and cannot loop.
       - name: Answer replies
-        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -855,7 +866,7 @@ jobs:
       # label. Removing it fires `unlabeled`, which is not a trigger, so this
       # cannot loop. The label is a trigger, never a record of approval.
       - name: Remove the trigger label
-        if: always()
+        if: needs.resolve.outputs.run == 'true' && (always())
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
