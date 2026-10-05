@@ -134,9 +134,39 @@ jobs:
                 if gh api -X POST "repos/$REPO/pulls/$PR/reviews" \
                      -f commit_id="$SHA" -f event="$EVENT" -f body="$BODY" >/dev/null; then
                   echo "  review: $EVENT at ${SHA:0:9}"
+                elif [ "$WANT" = approve ]; then
+                  # APPROVE is refused unless the repository allows GitHub
+                  # Actions to approve pull requests (the setting cannot be read
+                  # without admin rights, so detect it by the refusal). Do NOT
+                  # leave the bot's earlier request-changes standing over a
+                  # commit Claude now finds clean -- that would block the PR
+                  # until a person noticed. Fall back to what needs no setting:
+                  # withdraw the stale request, and post the clean review as a
+                  # comment. A person approves; the gate check is still green.
+                  echo "::warning::APPROVE refused on PR $PR (is 'Allow GitHub Actions to create and approve pull requests' off?). Withdrawing the bot's request-changes and commenting instead."
+                  for id in $(jq -r '.[] | select(.state == "CHANGES_REQUESTED") | .id' "$RUNNER_TEMP/bot-reviews-$PR.json"); do
+                    if gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
+                         -f message="Claude review: no blocking issues at ${SHA:0:9}. This request for changes no longer applies." \
+                         -f event=DISMISS >/dev/null; then
+                      echo "  review: dismissed request-changes $id"
+                    else
+                      echo "::error::Could not dismiss the bot's request-changes $id on PR $PR."
+                      DISMISS_FAILED=true
+                    fi
+                  done
+                  # One comment per commit: the gate re-evaluates on every push
+                  # to the base branch, and must not repeat itself.
+                  local MARK="<!-- claude-gate:clean:$SHA -->"
+                  if jq -e --arg m "$MARK" 'any(.[]; (.body // "") | contains($m))' "$RUNNER_TEMP/bot-reviews-$PR.json" >/dev/null; then
+                    echo "  review: clean-review comment already posted for ${SHA:0:9}"
+                  elif gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$SHA" -f event=COMMENT \
+                         -f body="$(printf '%s\n' "$BODY" "" "> **No blocking issues — but the bot cannot approve:** this repository does not allow GitHub Actions to approve pull requests, so a person needs to approve." "" "$MARK")" >/dev/null; then
+                    echo "  review: posted the clean review as a comment at ${SHA:0:9}"
+                  else
+                    echo "::warning::Could not post the clean review as a comment on PR $PR."
+                  fi
                 else
-                  # Not submitting an approval fails closed; say why it happened.
-                  echo "::warning::Could not submit $EVENT on PR $PR. If this is a 422/403, enable 'Allow GitHub Actions to create and approve pull requests'."
+                  echo "::warning::Could not submit $EVENT on PR $PR."
                 fi
                 ;;
               dismiss|dismiss_all)
