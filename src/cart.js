@@ -17,11 +17,7 @@ function itemCount(items) {
 
 // Remove the line item with the given sku and return the remaining items.
 function removeItem(items, sku) {
-  const index = items.findIndex((item) => item.sku === sku);
-  if (index !== -1) {
-    items.splice(index, 1);
-  }
-  return items;
+  return items.filter((item) => item.sku !== sku);
 }
 
 module.exports = { subtotal, applyDiscount, itemCount, removeItem };

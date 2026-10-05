@@ -23,3 +23,9 @@ test("removeItem drops the matching sku", () => {
   const items = [{ sku: "a", priceCents: 100, qty: 1 }, { sku: "b", priceCents: 200, qty: 1 }];
   assert.deepStrictEqual(removeItem(items, "a").map((i) => i.sku), ["b"]);
 });
+
+test("removeItem does not mutate its argument", () => {
+  const items = [{ sku: "a", priceCents: 100, qty: 1 }];
+  removeItem(items, "a");
+  assert.strictEqual(items.length, 1);
+});
