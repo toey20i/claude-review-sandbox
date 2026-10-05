@@ -143,12 +143,16 @@ jobs:
   # until its `needs` are met.
   checks:
     needs: resolve
-    if: needs.resolve.outputs.run == 'true'
-    name: Other checks
+    # Never skipped at job level: a skipped job still writes a check entry
+    # under this job's name, and GitHub shows the NEWEST entry per name -- so
+    # every no-op event (a description edit, the Jira bot's link, an unrelated
+    # label) used to hide the real result behind "skipped". When there is
+    # nothing to do the job runs as a no-op under a different name instead.
+    name: "${{ needs.resolve.outputs.run == 'true' && 'Other checks' || 'Other checks: nothing to do' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: claude-checks-${{ needs.resolve.outputs.pr }}-${{ needs.resolve.outputs.trigger }}
+      group: claude-checks-${{ needs.resolve.outputs.run == 'true' && format('{0}-{1}', needs.resolve.outputs.pr, needs.resolve.outputs.trigger) || github.run_id }}
       cancel-in-progress: ${{ needs.resolve.outputs.trigger == 'push' }}
     permissions:
       actions: write # read sibling runs; cancel this run when one fails
@@ -156,6 +160,7 @@ jobs:
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
     steps:
       - name: Other checks passed
+        if: needs.resolve.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -206,8 +211,12 @@ jobs:
     # `CHES-<digits>` test and never approves a ticketless pull request, so this
     # coarse filter only decides whether usage is spent.
     needs: resolve
-    if: needs.resolve.outputs.run == 'true'
-    name: Claude Review
+    # Never skipped at job level: a skipped job still writes a check entry
+    # under this job's name, and GitHub shows the NEWEST entry per name -- so
+    # every no-op event (a description edit, the Jira bot's link, an unrelated
+    # label) used to hide the real result behind "skipped". When there is
+    # nothing to do the job runs as a no-op under a different name instead.
+    name: "${{ needs.resolve.outputs.run == 'true' && 'Claude Review' || 'Claude Review: nothing to do' }}"
     runs-on: ubuntu-latest
     # Reviews of this pull request have grown from ~9 minutes to over 30 as the
     # workflow files have. A timeout is an infrastructure outcome, not a verdict,
@@ -227,7 +236,7 @@ jobs:
     concurrency:
       # Reply runs queue in their own group: a reply must never cancel the
       # review of a new push, and a push must not cancel an answer to a reply.
-      group: claude-review-${{ needs.resolve.outputs.pr }}-${{ needs.resolve.outputs.trigger }}
+      group: claude-review-${{ needs.resolve.outputs.run == 'true' && format('{0}-{1}', needs.resolve.outputs.pr, needs.resolve.outputs.trigger) || github.run_id }}
       cancel-in-progress: ${{ needs.resolve.outputs.trigger == 'push' }}
 
     permissions:
@@ -266,6 +275,7 @@ jobs:
       # `main`, and nothing would re-trigger the reviews.) base.sha is recorded
       # for the audit trail only.
       - name: "context pr=${{ needs.resolve.outputs.pr }} head=${{ needs.resolve.outputs.head }} ref=${{ needs.resolve.outputs.ref }} base=${{ needs.resolve.outputs.base }} trigger=${{ needs.resolve.outputs.trigger }} comment=${{ needs.resolve.outputs.comment }}"
+        if: needs.resolve.outputs.run == 'true'
         # Block scalar, not a plain one: in a plain YAML scalar a space followed
         # by `#` begins a comment, so `echo "... PR #$PR_NUMBER ..."` truncates
         # mid-string and the step dies on an unterminated quote.
@@ -280,6 +290,7 @@ jobs:
       # failing SHA into a passing one; the way to get a new verdict is a new
       # commit.
       - name: Reuse any existing verdict for this SHA
+        if: needs.resolve.outputs.run == 'true'
         id: already
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -375,7 +386,7 @@ jobs:
       # repository secrets against an untrusted head. Fork PRs therefore get no
       # secrets and no review, which is the correct trade.
       - name: Checkout
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         uses: actions/checkout@v5
         with:
           ref: ${{ needs.resolve.outputs.head }}
@@ -386,7 +397,7 @@ jobs:
       # The action already restores CLAUDE.md and .claude/ from the base branch
       # for this reason; REVIEW.md needs the same treatment.
       - name: Pin review instructions to the base branch
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE_REF: ${{ needs.resolve.outputs.ref }}
@@ -433,7 +444,7 @@ jobs:
       # patient-export.csv, dump.sql, .env.production, server.pem and
       # secrets.json all do; .env.example, .env.test and *.interface.ts do not.
       - name: Refuse likely production data or credentials
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -466,7 +477,7 @@ jobs:
       # trusted step, removes the dependency on shell access entirely.
       # Removed first, so a pull request cannot pre-plant these files.
       - name: Prepare the change for review
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -509,7 +520,7 @@ jobs:
 
       - name: Record review start
         id: started
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -518,7 +529,7 @@ jobs:
 
       - name: Review
         id: review
-        if: steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (steps.already.outputs.skip != 'true')
         continue-on-error: true # the Verdict step below is the single decision point
         env:
           # /code-review dispatches its finder agents as BACKGROUND subagents and
@@ -644,7 +655,7 @@ jobs:
       # Failing here is retryable: the commit gets no verdict.
       - name: "Verdict: review completed"
         id: completed
-        if: always() && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -753,7 +764,7 @@ jobs:
       # `Claude Review Gate` keys on this exact step name.
       - name: "Verdict: no blocking findings"
         id: findings
-        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -823,7 +834,7 @@ jobs:
       # Claude's prose about source code -- the same content already posted as
       # comments -- and expires quickly.
       - name: Hand the review body to the gate
-        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true')
         uses: actions/upload-artifact@v4
         with:
           name: claude-review-body
@@ -835,7 +846,7 @@ jobs:
       # or not the verdict passed. Posted with GITHUB_TOKEN, so they trigger no
       # workflow and cannot loop.
       - name: Answer replies
-        if: always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true'
+        if: needs.resolve.outputs.run == 'true' && (always() && steps.completed.outcome == 'success' && steps.already.outputs.skip != 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -855,7 +866,7 @@ jobs:
       # label. Removing it fires `unlabeled`, which is not a trigger, so this
       # cannot loop. The label is a trigger, never a record of approval.
       - name: Remove the trigger label
-        if: always()
+        if: needs.resolve.outputs.run == 'true' && (always())
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
