@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert");
-const { subtotal, applyDiscount, itemCount } = require("./cart");
+const { subtotal, applyDiscount, itemCount, removeItem } = require("./cart");
 
 test("subtotal sums price times quantity", () => {
   assert.strictEqual(subtotal([{ priceCents: 250, qty: 2 }, { priceCents: 100, qty: 1 }]), 600);
@@ -17,4 +17,9 @@ test("applyDiscount rejects out-of-range percentages", () => {
 test("itemCount sums quantities", () => {
   assert.strictEqual(itemCount([{ priceCents: 250, qty: 2 }, { priceCents: 100, qty: 3 }]), 5);
   assert.strictEqual(itemCount([]), 0);
+});
+
+test("removeItem drops the matching sku", () => {
+  const items = [{ sku: "a", priceCents: 100, qty: 1 }, { sku: "b", priceCents: 200, qty: 1 }];
+  assert.deepStrictEqual(removeItem(items, "a").map((i) => i.sku), ["b"]);
 });

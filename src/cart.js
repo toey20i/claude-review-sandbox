@@ -15,4 +15,13 @@ function itemCount(items) {
   return items.reduce((count, item) => count + item.qty, 0);
 }
 
-module.exports = { subtotal, applyDiscount, itemCount };
+// Remove the line item with the given sku and return the remaining items.
+function removeItem(items, sku) {
+  const index = items.findIndex((item) => item.sku === sku);
+  if (index !== -1) {
+    items.splice(index, 1);
+  }
+  return items;
+}
+
+module.exports = { subtotal, applyDiscount, itemCount, removeItem };
