@@ -58,9 +58,14 @@ on:
 
 # Keyed on the commit being evaluated. Safe to supersede -- this workflow is
 # cheap, idempotent, and never runs Claude, so it can never cancel a review.
+# A push to the default branch re-evaluates every open pull request: one sweep
+# at a time, and a newer sweep supersedes an older one. Every other evaluation
+# gets its own group. Keying on head_sha (as before) let ANY comment cancel a
+# sweep: every issue_comment-triggered run carries the default branch's commit
+# as its head_sha, the same key as the sweep.
 concurrency:
-  group: claude-gate-${{ github.event.workflow_run.head_sha }}
-  cancel-in-progress: true
+  group: ${{ github.event.workflow_run.event == 'push' && 'claude-gate-sweep' || format('claude-gate-{0}', github.event.workflow_run.id) }}
+  cancel-in-progress: ${{ github.event.workflow_run.event == 'push' }}
 
 jobs:
   gate:
@@ -73,6 +78,13 @@ jobs:
       actions: read # read Claude Review run metadata -- the approval record
       checks: write # publish the gate verdict
     steps:
+      # The shared verdict/checks logic, from the DEFAULT BRANCH: a
+      # workflow_run job checks out the default branch, never the PR.
+      - name: Load the review library
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/claude-review
+          persist-credentials: false
       - name: Evaluate and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -159,22 +171,7 @@ jobs:
           # Latest run of every non-Claude workflow on commit $1. Prints "pass",
           # "pending", or "failed: <names>". Read here, from the default-branch
           # copy, rather than trusting anything the PR-controlled run recorded.
-          other_checks() {
-            local runs
-            runs=$(gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=100" --paginate \
-              | jq -s '[.[].workflow_runs[]
-                        | select(.path | test("^\\.github/workflows/claude-") | not)
-                        | {name, status, conclusion, id}]
-                       | group_by(.name) | map(max_by(.id))') || { echo "pending"; return; }
-            local failed
-            failed=$(jq -r '[.[] | select(.status == "completed"
-                                  and (.conclusion | IN("success", "skipped", "neutral") | not))
-                             | "\(.name) (\(.conclusion))"] | join(", ")' <<<"$runs")
-            if [ -n "$failed" ]; then echo "failed: $failed"
-            elif [ "$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")" -gt 0 ]; then echo "pending"
-            else echo "pass"
-            fi
-          }
+          LIB="$GITHUB_WORKSPACE/.github/claude-review/lib.sh"
 
           publish() {
             gh api -X POST "repos/$REPO/check-runs" \
@@ -231,6 +228,7 @@ jobs:
             local FILTER='[.tree[]
                      | select(.type == "blob")
                      | select((.path | startswith(".github/workflows/"))
+                              or (.path | startswith(".github/claude-review/"))
                               or .path == ".github/CODEOWNERS"
                               or .path == "REVIEW.md"
                               or (.path | endswith("CLAUDE.md") or endswith("CLAUDE.local.md"))
@@ -255,72 +253,44 @@ jobs:
               return
             fi
 
-            # --- 2. ticket ---------------------------------------------------
+            # --- 2. the approval record --------------------------------------
+            # Shared with claude-review.yml via lib.sh, so the two can never
+            # disagree. Which runs count and how push/label/reply verdicts
+            # combine is documented there. Bound to the base REF, not the base
+            # SHA: like a human approval it survives `main` advancing but not a
+            # retarget.
+            local V VERDICT VERDICT_RUN
+            if ! V=$(bash "$LIB" verdict "$REPO" "$PR" "$SHA" "$BASE"); then
+              publish "$SHA" failure "Could not read review history" \
+                "The approval record for \`${SHA:0:9}\` could not be read. Re-run this check."
+              review "$PR" "$SHA" dismiss "Claude approval withdrawn: the review history could not be read."
+              return
+            fi
+            VERDICT=$(jq -r '.verdict' <<<"$V"); VERDICT_RUN=$(jq -r '.run // empty' <<<"$V")
+            echo "  verdict: $(jq -c . <<<"$V")"
+
+            # --- 3. ticket ---------------------------------------------------
             # Pull requests with no CHES ticket in the title (designer
-            # prototypes) are not reviewed. The gate goes green so they are not
-            # stuck behind a red check, but the bot NEVER approves one and
-            # withdraws any earlier approval -- so dropping the ticket from a
-            # title cannot be used to skip review; merging still needs a human
-            # approval. Checked after integrity, so a ticketless pull request
-            # that touches the review machinery stays red.
+            # prototypes) are not reviewed and the bot never approves one. The
+            # gate goes green so they are not stuck behind a red check --
+            # UNLESS this head already has a rejection: dropping the ticket
+            # must not clear one (it used to). Only approvals are withdrawn; a
+            # standing request-changes stays. Checked after integrity, so a
+            # ticketless pull request that touches the machinery stays red.
             local TITLE
             TITLE=$(jq -r --arg sha "$SHA" '[.[] | select(.state == "open" and .head.sha == $sha)][0].title // ""' \
                      "$RUNNER_TEMP/pulls-$PR.json")
             if ! grep -qiE 'CHES-[0-9]+' <<<"$TITLE"; then
-              publish "$SHA" success "Skipped — no CHES ticket in the title" \
-                "Claude does not review pull requests without a \`CHES-<n>\` ticket in the title (e.g. design prototypes). This pull request needs a human review to merge. Add a ticket to the title to start a Claude review."
-              review "$PR" "$SHA" dismiss_all "Claude review withdrawn: the title no longer carries a CHES ticket, so this pull request needs a human review."
+              if [ "$VERDICT" = "failure" ]; then
+                publish "$SHA" failure "Blocking findings stand at ${SHA:0:8}" \
+                  "Claude found blocking issues in \`${SHA:0:9}\`. Removing the ticket from the title does not clear them: fix them and push, or have a person dismiss the review."
+              else
+                publish "$SHA" success "Skipped — no CHES ticket in the title" \
+                  "Claude does not review pull requests without a \`CHES-<n>\` ticket in the title (e.g. design prototypes). This pull request needs a human review to merge. Add a ticket to the title to start a Claude review."
+              fi
+              review "$PR" "$SHA" dismiss "Claude approval withdrawn: the title has no CHES ticket, so this pull request needs a human review."
               return
             fi
-
-            # --- 3. the approval record --------------------------------------
-            # A successful review whose ANCHOR names this pull request, this head
-            # commit AND this base branch. The anchor is a step name, evaluated
-            # at run start and stored per attempt; `pull_requests[]` is NOT used
-            # because it lists only OPEN pull requests, so closing one erases
-            # every approval recorded against it.
-            #
-            # Bound to the base REF, not the base SHA -- like a human approval,
-            # it survives `main` advancing but not a retarget. Binding the SHA
-            # would dismiss every approval on every merge to `main`, with
-            # nothing to re-trigger the reviews.
-            local WANT="context pr=$PR head=$SHA ref=$BASE "
-            # Runs recorded against this commit, plus comment-triggered runs
-            # since it was made (an issue_comment run is recorded against the
-            # default branch's commit). Oldest first: a push/label failure is
-            # sticky, but a NEWER reply-triggered verdict overrides it.
-            local SINCE
-            SINCE=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.committer.date')
-            { gh api "repos/$REPO/actions/workflows/claude-review.yml/runs?head_sha=$SHA&per_page=100" --paginate \
-                --jq '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"'
-              local ev
-              for ev in issue_comment pull_request_review_comment; do
-                gh api "repos/$REPO/actions/workflows/claude-review.yml/runs?event=$ev&created=%3E%3D$SINCE&per_page=100" --paginate \
-                  --jq '.workflow_runs[] | "\(.id) \(.run_attempt // 1)"'
-              done; } | sort -n -u > "$RUNNER_TEMP/runs-$PR.txt"
-
-            local VERDICT="none" VERDICT_RUN="" rid attempts k RESP CTX STEP T
-            while read -r rid attempts; do
-              [ -n "$rid" ] || continue
-              for k in $(seq 1 "${attempts:-1}"); do
-                if ! RESP=$(gh api "repos/$REPO/actions/runs/$rid/attempts/$k/jobs" 2>/dev/null); then
-                  publish "$SHA" failure "Could not read review history" \
-                    "Reading attempt $k of run $rid failed, so the approval record for \`${SHA:0:9}\` cannot be established. Re-run this check."
-                  review "$PR" "$SHA" dismiss "Claude approval withdrawn: the review history could not be read."
-                  return
-                fi
-                CTX=$(jq -r '[.jobs[].steps[]? | select(.name | startswith("context ")) | .name] | first // ""' <<<"$RESP")
-                case "$CTX" in "$WANT"*) ;; *) continue ;; esac
-                T=$(sed -n 's/.* trigger=\([a-z]*\).*/\1/p' <<<"$CTX"); T=${T:-push}
-                STEP=$(jq -r '[.jobs[].steps[]? | select(.name == "Verdict: no blocking findings") | .conclusion] | first // "absent"' <<<"$RESP")
-                case "$T:$STEP" in
-                  reply:success) VERDICT="success"; VERDICT_RUN="$rid" ;;
-                  reply:failure) VERDICT="failure"; VERDICT_RUN="$rid" ;;
-                  *:failure)     VERDICT="failure"; VERDICT_RUN="$rid" ;;
-                  *:success)     [ "$VERDICT" = failure ] || { VERDICT="success"; VERDICT_RUN="$rid"; } ;;
-                esac
-              done
-            done < "$RUNNER_TEMP/runs-$PR.txt"
 
             local RUNS_URL="https://github.com/$REPO/pull/$PR/checks" BODY=""
             [ -n "$VERDICT_RUN" ] && BODY=$(review_body "$VERDICT_RUN")
@@ -330,7 +300,7 @@ jobs:
             # too: the review runs in parallel with CI, so it can finish first.
             if [ "$VERDICT" = "success" ]; then
               local CI
-              CI=$(other_checks "$SHA")
+              CI=$(bash "$LIB" checks "$REPO" "$SHA")
               if [ "$CI" != "pass" ]; then
                 publish "$SHA" failure "Reviewed clean, but other checks are ${CI%%:*}" \
                   "Claude found no blocking issues in \`${SHA:0:9}\`, but it is approved only once every other check has passed. Other checks: **$CI**."
